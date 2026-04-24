@@ -74,4 +74,132 @@ Content-Type: application/json
 
 ###
 
+# ──────────────────────────────────────────────
+# FILE UPLOAD ENDPOINTS
+# ──────────────────────────────────────────────
+# Note: replace the file paths below (< ./your-file.pdf) with actual files on your machine.
+# The REST Client extension sends multipart/form-data automatically when you use this syntax.
+
+### Universal upload — auto-detects file type (PDF / Excel / CSV / image)
+POST {{baseUrl}}/upload
+Content-Type: multipart/form-data; boundary=----Boundary
+
+------Boundary
+Content-Disposition: form-data; name="file"; filename="Payment_Receipt.pdf"
+Content-Type: application/octet-stream
+
+< ./Payment_Receipt.pdf
+------Boundary
+Content-Disposition: form-data; name="question"
+
+Summarise this document. What are the key figures?
+------Boundary--
+
+###
+POST {{baseUrl}}/upload/pdf
+Content-Type: multipart/form-data; boundary=----Boundary
+
+------Boundary
+Content-Disposition: form-data; name="file"; filename="Payment_Receipt.pdf"
+Content-Type: application/pdf
+
+< ./Payment_Receipt.pdf
+------Boundary
+Content-Disposition: form-data; name="question"
+
+What are the key financial highlights and any risks mentioned?
+------Boundary--
+
+###
+
+### Upload PDF — targeted question
+POST {{baseUrl}}/upload/pdf
+Content-Type: multipart/form-data; boundary=----Boundary
+
+------Boundary
+Content-Disposition: form-data; name="file"; filename="annual_report.pdf"
+Content-Type: application/pdf
+
+< ./annual_report.pdf
+------Boundary
+Content-Disposition: form-data; name="question"
+
+What was the total revenue, net income, and operating margin for the most recent year?
+------Boundary
+Content-Disposition: form-data; name="max_tokens"
+
+1024
+------Boundary--
+
+###
+
+### Upload Excel — column sum / trend question
+POST {{baseUrl}}/upload/excel
+Content-Type: multipart/form-data; boundary=----Boundary
+
+------Boundary
+Content-Disposition: form-data; name="file"; filename="financials.xlsx"
+Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+
+< ./financials.xlsx
+------Boundary
+Content-Disposition: form-data; name="question"
+
+What is the total of the Revenue column? Which month had the highest profit?
+------Boundary--
+
+###
+
+### Upload CSV — trend analysis
+POST {{baseUrl}}/upload/excel
+Content-Type: multipart/form-data; boundary=----Boundary
+
+------Boundary
+Content-Disposition: form-data; name="file"; filename="sales_data.csv"
+Content-Type: text/csv
+
+< ./sales_data.csv
+------Boundary
+Content-Disposition: form-data; name="question"
+
+What is the overall sales trend? Are there any anomalies or months that underperformed?
+------Boundary--
+
+###
+
+### Upload Chart / Image — trend question
+### Requires: ollama pull granite3.2-vision
+POST {{baseUrl}}/upload/image
+Content-Type: multipart/form-data; boundary=----Boundary
+
+------Boundary
+Content-Disposition: form-data; name="file"; filename="revenue_chart.png"
+Content-Type: image/png
+
+< ./revenue_chart.png
+------Boundary
+Content-Disposition: form-data; name="question"
+
+What trend does this chart show? What are the highest and lowest values visible?
+------Boundary--
+
+###
+
+### Upload Chart — investment signal question
+POST {{baseUrl}}/upload/image
+Content-Type: multipart/form-data; boundary=----Boundary
+
+------Boundary
+Content-Disposition: form-data; name="file"; filename="stock_chart.png"
+Content-Type: image/png
+
+< ./stock_chart.png
+------Boundary
+Content-Disposition: form-data; name="question"
+
+Based on this price chart, what technical patterns are visible? Is the trend bullish or bearish?
+------Boundary--
+
+###
+
 
