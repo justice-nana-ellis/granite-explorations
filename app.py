@@ -1,90 +1,52 @@
 import os
-import shutil
-import tempfile
-from pathlib import Path
+import time
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from openai import OpenAI
 from typing import Optional
-import chromadb
-import pandas as pd
-from docling.document_converter import DocumentConverter
 
 load_dotenv()
 
 # Ollama runs locally — no token needed
-# Make sure you have run: ollama pull granite3.3
-MODEL_ID = "granite3.3"
-EMBED_MODEL = "nomic-embed-text"  # pull with: ollama pull nomic-embed-text
+# granite3.2:2b is ~4x faster than granite3.3 (8B) on CPU
+MODEL_ID = "granite3.2:2b"
 
 client = OpenAI(
     base_url="http://localhost:11434/v1",
     api_key="ollama",  # Ollama doesn't need a real key, but the param is required
 )
 
-# ChromaDB stores document chunks locally in ./chroma_db
-chroma_client = chromadb.PersistentClient(path="./chroma_db")
-collection = chroma_client.get_or_create_collection("documents")
-
-doc_converter = DocumentConverter()
-
-
-def embed(text: str) -> list[float]:
-    """Generate an embedding for a piece of text using Ollama."""
-    response = client.embeddings.create(model=EMBED_MODEL, input=text)
-    return response.data[0].embedding
-
-
-def chunk_text(text: str, chunk_size: int = 400) -> list[str]:
-    """Split text into overlapping chunks so context isn't lost at boundaries."""
-    words = text.split()
-    chunks = []
-    for i in range(0, len(words), chunk_size - 50):  # 50-word overlap
-        chunk = " ".join(words[i: i + chunk_size])
-        if chunk:
-            chunks.append(chunk)
-    return chunks
-
-
-def parse_file(file_path: str, filename: str) -> list[str]:
-    """Parse a file into a list of text chunks based on its type."""
-    ext = Path(filename).suffix.lower()
-    chunks = []
-
-    if ext in [".pdf", ".docx"]:
-        result = doc_converter.convert(file_path)
-        text = result.document.export_to_markdown()
-        chunks = chunk_text(text)
-
-    elif ext in [".csv"]:
-        df = pd.read_csv(file_path)
-        for _, row in df.iterrows():
-            text = ", ".join([f"{col}: {val}" for col, val in row.items()])
-            chunks.append(text)
-
-    elif ext in [".xlsx", ".xls"]:
-        df = pd.read_excel(file_path)
-        for _, row in df.iterrows():
-            text = ", ".join([f"{col}: {val}" for col, val in row.items()])
-            chunks.append(text)
-
-    elif ext in [".txt", ".md"]:
-        with open(file_path, "r", encoding="utf-8") as f:
-            text = f.read()
-        chunks = chunk_text(text)
-
-    else:
-        raise ValueError(f"Unsupported file type: {ext}")
-
-    return chunks
-
 app = FastAPI(
     title="Granite Finance API",
     description="A simple API wrapping IBM Granite via Hugging Face Inference API",
     version="1.0.0",
 )
+
+
+@app.on_event("startup")
+async def warmup():
+    """Send a tiny request at startup so the first real request isn't slow."""
+    try:
+        client.chat.completions.create(
+            model=MODEL_ID,
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=1,
+        )
+        print(f"Model '{MODEL_ID}' warmed up and ready.")
+    except Exception:
+        print(f"Warning: could not warm up model '{MODEL_ID}'. Is Ollama running?")
+
+
+@app.middleware("http")
+async def add_response_time_header(request: Request, call_next):
+    """Adds X-Response-Time header (ms) to every response."""
+    start = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    response.headers["X-Response-Time"] = f"{elapsed_ms:.0f}ms"
+    return response
+
 
 SYSTEM_PROMPT = """You are a helpful financial analyst assistant powered by IBM Granite.
 Answer questions clearly and precisely. 
@@ -226,147 +188,3 @@ Analyse the provided data or question with the following rules:
         raise HTTPException(status_code=502, detail=f"Granite API error: {str(e)}")
 
     return {"analysis": response.choices[0].message.content, "model": MODEL_ID}
-
-
-# --- Document / RAG endpoints ---
-
-class RAGRequest(BaseModel):
-    question: str
-    max_tokens: Optional[int] = 512
-    temperature: Optional[float] = 0.3
-    num_sources: Optional[int] = 4  # how many document chunks to retrieve
-
-
-@app.post("/documents/upload")
-async def upload_document(file: UploadFile = File(...)):
-    """
-    Upload a document (PDF, Word, Excel, CSV, TXT) to be indexed.
-    The file is parsed, split into chunks, embedded, and stored in ChromaDB.
-    """
-    allowed = {".pdf", ".docx", ".xlsx", ".xls", ".csv", ".txt", ".md"}
-    ext = Path(file.filename).suffix.lower()
-
-    if ext not in allowed:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file type '{ext}'. Allowed: {', '.join(allowed)}"
-        )
-
-    # Save the uploaded file temporarily so docling/pandas can read it
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        tmp_path = tmp.name
-
-    try:
-        chunks = parse_file(tmp_path, file.filename)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse file: {str(e)}")
-    finally:
-        os.unlink(tmp_path)  # always clean up the temp file
-
-    if not chunks:
-        raise HTTPException(status_code=400, detail="No text could be extracted from the file.")
-
-    # Embed each chunk and store in ChromaDB
-    try:
-        embeddings = [embed(chunk) for chunk in chunks]
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Embedding error (is nomic-embed-text pulled?): {str(e)}")
-
-    # Use filename + index as unique IDs so re-uploading the same file overwrites it
-    ids = [f"{file.filename}::{i}" for i in range(len(chunks))]
-    metadatas = [{"source": file.filename, "chunk": i} for i in range(len(chunks))]
-
-    collection.upsert(
-        ids=ids,
-        documents=chunks,
-        embeddings=embeddings,
-        metadatas=metadatas,
-    )
-
-    return {
-        "message": f"'{file.filename}' indexed successfully.",
-        "chunks_stored": len(chunks),
-    }
-
-
-@app.get("/documents")
-def list_documents():
-    """List all documents that have been indexed."""
-    results = collection.get(include=["metadatas"])
-    if not results["metadatas"]:
-        return {"documents": [], "total_chunks": 0}
-
-    # Deduplicate to just unique filenames
-    sources = list({m["source"] for m in results["metadatas"]})
-    return {"documents": sources, "total_chunks": len(results["metadatas"])}
-
-
-@app.delete("/documents")
-def clear_documents():
-    """Delete all indexed documents from the vector store."""
-    global collection
-    chroma_client.delete_collection("documents")
-    collection = chroma_client.get_or_create_collection("documents")
-    return {"message": "All documents cleared."}
-
-
-@app.post("/chat/rag")
-def chat_rag(request: RAGRequest):
-    """
-    Ask a question and get an answer grounded in your uploaded documents.
-    Finds the most relevant chunks from your documents and sends them to Granite as context.
-    """
-    total = collection.count()
-    if total == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="No documents indexed yet. Upload files via POST /documents/upload first."
-        )
-
-    # Embed the question and find the most relevant document chunks
-    try:
-        query_embedding = embed(request.question)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Embedding error: {str(e)}")
-
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=min(request.num_sources, total),
-        include=["documents", "metadatas"],
-    )
-
-    context_chunks = results["documents"][0]
-    sources = list({m["source"] for m in results["metadatas"][0]})
-    context = "\n\n---\n\n".join(context_chunks)
-
-    messages = [
-        {
-            "role": "system",
-            "content": """You are a financial analyst assistant.
-Answer questions using ONLY the document context provided below.
-Always cite which document your answer comes from.
-If the answer is not in the context, say 'I could not find that in the uploaded documents.'
-Be precise with numbers and figures.""",
-        },
-        {
-            "role": "user",
-            "content": f"Document context:\n\n{context}\n\nQuestion: {request.question}",
-        },
-    ]
-
-    try:
-        response = client.chat.completions.create(
-            model=MODEL_ID,
-            messages=messages,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Granite API error: {str(e)}")
-
-    return {
-        "answer": response.choices[0].message.content,
-        "sources": sources,
-        "model": MODEL_ID,
-    }

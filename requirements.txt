@@ -3,8 +3,3 @@ uvicorn
 openai
 python-dotenv
 pydantic
-chromadb
-docling
-pandas
-openpyxl
-python-multipart
