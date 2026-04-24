@@ -1,0 +1,150 @@
+@baseUrl = http://localhost:8000
+
+### Health check
+GET {{baseUrl}}/health
+
+###
+
+### Root — check model info
+GET {{baseUrl}}/
+
+###
+
+### Single-turn chat — general question
+POST {{baseUrl}}/chat
+Content-Type: application/json
+
+{
+  "message": "What is a P/E ratio and why does it matter for investors?",
+  "max_tokens": 512,
+  "temperature": 0.7
+}
+
+###
+
+### Single-turn chat — custom system prompt
+POST {{baseUrl}}/chat
+Content-Type: application/json
+
+{
+  "message": "Summarise the key risks of investing in tech stocks right now.",
+  "system_prompt": "You are a conservative investment advisor who always highlights downside risks first.",
+  "max_tokens": 400,
+  "temperature": 0.5
+}
+
+###
+
+### Multi-turn chat — conversation with history
+POST {{baseUrl}}/chat/multi-turn
+Content-Type: application/json
+
+{
+  "messages": [
+    { "role": "system",    "content": "You are a financial analyst assistant." },
+    { "role": "user",      "content": "What is a P/E ratio?" },
+    { "role": "assistant", "content": "A P/E ratio (Price-to-Earnings) compares a company's share price to its earnings per share. A high P/E may indicate growth expectations, while a low P/E can suggest undervaluation." },
+    { "role": "user",      "content": "How does it compare to the P/B ratio?" }
+  ],
+  "max_tokens": 512,
+  "temperature": 0.7
+}
+
+###
+
+### Finance analysis — earnings data
+POST {{baseUrl}}/analyse
+Content-Type: application/json
+
+{
+  "message": "Q4 2024 results: Revenue $4.2B (up 12% YoY), Net Income $820M (up 8% YoY), Operating Margin 19.5%, Debt-to-Equity 1.4. Analyse this performance.",
+  "max_tokens": 768
+}
+
+###
+
+### Finance analysis — investment question
+POST {{baseUrl}}/analyse
+Content-Type: application/json
+
+{
+  "message": "A business has a P/E of 35, revenue growth of 25% YoY, gross margin of 68%, and free cash flow of $200M on $1B revenue. Is this a good investment?",
+  "max_tokens": 600
+}
+
+###
+
+# ─── Document / RAG endpoints ────────────────────────────────────────────────
+
+### Upload a PDF
+# Change the file path to a real file on your machine
+POST {{baseUrl}}/documents/upload
+Content-Type: multipart/form-data; boundary=boundary
+
+--boundary
+Content-Disposition: form-data; name="file"; filename="report.pdf"
+Content-Type: application/pdf
+
+< /path/to/your/report.pdf
+--boundary--
+
+###
+
+### Upload a CSV
+POST {{baseUrl}}/documents/upload
+Content-Type: multipart/form-data; boundary=boundary
+
+--boundary
+Content-Disposition: form-data; name="file"; filename="portfolio.csv"
+Content-Type: text/csv
+
+< /path/to/your/portfolio.csv
+--boundary--
+
+###
+
+### Upload an Excel file
+POST {{baseUrl}}/documents/upload
+Content-Type: multipart/form-data; boundary=boundary
+
+--boundary
+Content-Disposition: form-data; name="file"; filename="financials.xlsx"
+Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+
+< /path/to/your/financials.xlsx
+--boundary--
+
+###
+
+### List all indexed documents
+GET {{baseUrl}}/documents
+
+###
+
+### Ask a question about your uploaded documents (RAG)
+POST {{baseUrl}}/chat/rag
+Content-Type: application/json
+
+{
+  "question": "What was the total revenue mentioned in the documents?",
+  "max_tokens": 512,
+  "num_sources": 4
+}
+
+###
+
+### Ask a finance-specific question about your documents
+POST {{baseUrl}}/chat/rag
+Content-Type: application/json
+
+{
+  "question": "What are the key risks mentioned across all the documents?",
+  "max_tokens": 600,
+  "num_sources": 5
+}
+
+###
+
+### Clear all indexed documents
+DELETE {{baseUrl}}/documents
+
