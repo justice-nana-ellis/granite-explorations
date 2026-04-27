@@ -19,10 +19,11 @@ logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
 
 # --- Models ---
-# Text/analysis:  granite3.2:2b     (1.6 GB, ~3-4x faster than granite3.3 — ollama pull granite3.2:2b)
-# Vision/charts:  granite3.2-vision (2.4 GB, already pulled, running on GPU)
-MODEL_ID        = "granite3.2:2b"
-VISION_MODEL_ID = "granite3.2-vision:latest"
+# Set these in .env to switch models without changing code:
+#   MODEL_ID=granite3.3:latest
+#   VISION_MODEL_ID=granite3.3-vision:latest
+MODEL_ID        = os.getenv("MODEL_ID",        "granite3.2:2b")
+VISION_MODEL_ID = os.getenv("VISION_MODEL_ID", "granite3.2-vision:latest")
 
 client = OpenAI(
     base_url="http://localhost:11434/v1",
