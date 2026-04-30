@@ -6,6 +6,11 @@
       "use": "@vercel/python"
     }
   ],
+  "functions": {
+    "app.py": {
+      "maxDuration": 60
+    }
+  },
   "routes": [
     {
       "src": "/(.*)",

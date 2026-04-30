@@ -87,17 +87,67 @@ async def add_response_time_header(request: Request, call_next):
     return response
 
 
-SYSTEM_PROMPT = """You are a helpful financial analyst assistant powered by IBM Granite.
-Answer questions clearly and precisely. 
+SYSTEM_PROMPT = """Reasoning: low
+You are a helpful financial analyst assistant powered by IBM Granite.
+Answer questions clearly and precisely.
 When analysing financial data, always cite specific figures and flag any risks you notice.
 If you don't know something, say so clearly."""
 
-FINANCE_ANALYSIS_SYSTEM = """You are a senior financial analyst.
+FINANCE_ANALYSIS_SYSTEM = """Reasoning: low
+You are a senior financial analyst.
 Analyse the provided data or question with the following rules:
 - Be precise with numbers and percentages
 - Always mention key risks
 - Structure your output with clear sections
 - Flag any missing information that would improve the analysis"""
+
+
+import re as _re
+
+def _extract_answer(msg) -> str:
+    """Strip <think>...</think> blocks from reasoning model responses."""
+    text = msg.content or getattr(msg, "reasoning_content", None) or ""
+    text = _re.sub(r"<think>.*?</think>", "", text, flags=_re.DOTALL).strip()
+    return text
+
+
+def _stream_answer(client_obj, **kwargs) -> str:
+    """
+    Stream a chat completion and discard all tokens inside <think>...</think>.
+    This prevents Vercel from buffering the full reasoning chain in memory —
+    only the visible answer is accumulated and returned.
+    """
+    inside_think = False
+    buffer = ""
+    answer_parts = []
+
+    with client_obj.chat.completions.create(stream=True, **kwargs) as stream:
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content or "" if chunk.choices else ""
+            buffer += delta
+
+            while buffer:
+                if inside_think:
+                    end = buffer.find("</think>")
+                    if end == -1:
+                        buffer = ""  # still inside think, discard
+                        break
+                    else:
+                        buffer = buffer[end + len("</think>"):]
+                        inside_think = False
+                else:
+                    start = buffer.find("<think>")
+                    if start == -1:
+                        answer_parts.append(buffer)
+                        buffer = ""
+                        break
+                    else:
+                        answer_parts.append(buffer[:start])
+                        buffer = buffer[start + len("<think>"):]
+                        inside_think = True
+
+    return "".join(answer_parts).strip()
+
 
 
 # --- Request / Response models ---
@@ -141,19 +191,12 @@ def chat(request: ChatRequest):
     ]
 
     try:
-        response = client.chat.completions.create(
-            model=MODEL_ID,
-            messages=messages,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-        )
+        reply = _stream_answer(client, model=MODEL_ID, messages=messages,
+                              max_tokens=request.max_tokens, temperature=request.temperature)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Granite API error: {str(e)}")
 
-    reply = response.choices[0].message.content
-    tokens = response.usage.total_tokens if response.usage else None
-
-    return ChatResponse(reply=reply, model=MODEL_ID, tokens_used=tokens)
+    return ChatResponse(reply=reply, model=MODEL_ID, tokens_used=None)
 
 
 @app.post("/analyse")
@@ -168,16 +211,12 @@ def analyse(request: ChatRequest):
     ]
 
     try:
-        response = client.chat.completions.create(
-            model=MODEL_ID,
-            messages=messages,
-            max_tokens=request.max_tokens or 768,
-            temperature=0.3,  # lower temperature for factual analysis
-        )
+        analysis = _stream_answer(client, model=MODEL_ID, messages=messages,
+                                  max_tokens=request.max_tokens or 768, temperature=0.3)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Granite API error: {str(e)}")
 
-    return {"analysis": response.choices[0].message.content, "model": MODEL_ID}
+    return {"analysis": analysis, "model": MODEL_ID}
 
 
 # ──────────────────────────────────────────────
@@ -215,18 +254,11 @@ async def upload_any(
             {"role": "user",   "content": question},
         ]
         try:
-            response = client.chat.completions.create(
-                model=MODEL_ID, messages=messages,
-                max_tokens=max_tokens, temperature=0.7,
-            )
+            answer = _stream_answer(client, model=MODEL_ID, messages=messages,
+                                    max_tokens=max_tokens, temperature=0.7)
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Granite API error: {str(e)}")
-        return {
-            "type": "chat",
-            "answer": response.choices[0].message.content,
-            "model": MODEL_ID,
-            "tokens_used": response.usage.total_tokens if response.usage else None,
-        }
+        return {"type": "chat", "answer": answer, "model": MODEL_ID, "tokens_used": None}
 
     # File provided — use default question if none given
     question = question or "Analyse this file and highlight the key information."
@@ -253,17 +285,13 @@ async def upload_any(
             }
         ]
         try:
-            response = vision_client.chat.completions.create(
-                model=VISION_MODEL_ID, messages=messages,
-                max_tokens=max_tokens, temperature=0.3,
-            )
+            answer = _stream_answer(vision_client, model=VISION_MODEL_ID, messages=messages,
+                                    max_tokens=max_tokens, temperature=0.3)
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Vision model error: {str(e)}")
         return {
             "file": file.filename, "type": "image",
-            "answer": response.choices[0].message.content,
-            "model": VISION_MODEL_ID,
-            "tokens_used": response.usage.total_tokens if response.usage else None,
+            "answer": answer, "model": VISION_MODEL_ID, "tokens_used": None,
         }
 
     elif ext in PDF_EXTS:
@@ -291,17 +319,13 @@ async def upload_any(
             {"role": "user",   "content": f"Document:\n\n{extracted_text}\n\n---\nQuestion: {question}"},
         ]
         try:
-            response = client.chat.completions.create(
-                model=MODEL_ID, messages=messages,
-                max_tokens=max_tokens, temperature=0.3,
-            )
+            answer = _stream_answer(client, model=MODEL_ID, messages=messages,
+                                    max_tokens=max_tokens, temperature=0.3)
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Granite API error: {str(e)}")
         return {
             "file": file.filename, "type": "pdf",
-            "answer": response.choices[0].message.content,
-            "model": MODEL_ID, "truncated": truncated,
-            "tokens_used": response.usage.total_tokens if response.usage else None,
+            "answer": answer, "model": MODEL_ID, "truncated": truncated, "tokens_used": None,
         }
 
     elif ext in TABLE_EXTS:
@@ -336,23 +360,16 @@ async def upload_any(
             {"role": "user",   "content": f"Spreadsheet:\n\n{data_context}\n\n---\nQuestion: {question}"},
         ]
         try:
-            response = client.chat.completions.create(
-                model=MODEL_ID, messages=messages,
-                max_tokens=max_tokens, temperature=0.3,
-            )
+            answer = _stream_answer(client, model=MODEL_ID, messages=messages,
+                                    max_tokens=4096, temperature=0.3)
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Granite API error: {str(e)}")
-
-        msg = response.choices[0].message
-        # Dump every field on the message so we can see where the answer lives
-        # print("DEBUG msg dict:", msg.model_dump() if hasattr(msg, "model_dump") else vars(msg))
-        answer = msg.content or getattr(msg, "reasoning_content", None) or ""
 
         return {
             "file": file.filename, "type": "spreadsheet",
             "answer": answer,
             "model": MODEL_ID, "rows": df.shape[0], "num_columns": df.shape[1],
-            "tokens_used": response.usage.total_tokens if response.usage else None,
+            "tokens_used": None,
         }
 
     else:
