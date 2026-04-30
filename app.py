@@ -20,13 +20,30 @@ logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
 
 # --- Models ---
 
-MODEL_ID        = os.getenv("MODEL_ID",        "granite3.2:2b")
+MODEL_ID        = os.getenv("MODEL_ID",        "openai/gpt-oss-20b")
 VISION_MODEL_ID = os.getenv("VISION_MODEL_ID", "granite3.2-vision:latest")
 
-client = OpenAI(
-    base_url="http://localhost:11434/v1",
-    api_key="ollama",  # Ollama doesn't need a real key, but the param is required
-)
+HF_TOKEN = os.getenv("HF_TOKEN")  # required only for HuggingFace models
+
+
+def _is_ollama(model_id: str) -> bool:
+    """Ollama model IDs use 'name:tag' format. HuggingFace uses 'org/repo'."""
+    return "/" not in model_id
+
+
+def _make_client(model_id: str) -> OpenAI:
+    if _is_ollama(model_id):
+        return OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
+    if not HF_TOKEN:
+        raise RuntimeError(
+            f"HF_TOKEN is required for HuggingFace model '{model_id}'. "
+            "Set it in your .env file."
+        )
+    return OpenAI(base_url="https://router.huggingface.co/v1", api_key=HF_TOKEN)
+
+
+client        = _make_client(MODEL_ID)
+vision_client = _make_client(VISION_MODEL_ID)
 
 app = FastAPI(
     title="Granite Finance API",
@@ -37,20 +54,27 @@ app = FastAPI(
 
 @app.on_event("startup")
 async def startup():
-    try:
-        client.chat.completions.create(
-            model=MODEL_ID,
-            messages=[{"role": "user", "content": "hi"}],
-            max_tokens=1,
-        )
+    errors = []
+    for label, c, mid in [("model", client, MODEL_ID), ("vision", vision_client, VISION_MODEL_ID)]:
+        try:
+            c.chat.completions.create(
+                model=mid,
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=1,
+            )
+            print(f"  {label:6s} : {mid}  ✓")
+        except Exception as e:
+            errors.append(f"  ⚠  {label}: {e}")
+    if errors:
+        print(f"")
+        for err in errors:
+            print(err)
+        print(f"")
+    else:
         print(f"")
         print(f"  model  : {MODEL_ID}  ✓")
         print(f"  vision : {VISION_MODEL_ID}  ✓")
         print(f"  server : http://localhost:8000  🚀")
-        print(f"")
-    except Exception:
-        print(f"")
-        print(f"  ⚠  Ollama not responding — run: ollama serve")
         print(f"")
 
 
@@ -230,7 +254,7 @@ async def upload_any(
             }
         ]
         try:
-            response = client.chat.completions.create(
+            response = vision_client.chat.completions.create(
                 model=VISION_MODEL_ID, messages=messages,
                 max_tokens=max_tokens, temperature=0.3,
             )
