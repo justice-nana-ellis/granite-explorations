@@ -341,15 +341,21 @@ async def upload_any(
         except Exception:
             stats = "No numeric statistics available."
 
-        # With wide files (many columns) the preview explodes in size.
-        # Cap preview to 10 columns and 20 rows, then hard-limit total chars.
-        preview_df = df.iloc[:20, :10]
-        MAX_CONTEXT_CHARS = 6000
+        # With wide files (many columns) the preview and stats explode in size.
+        # Only describe the first 10 numeric columns to keep stats manageable.
+        numeric_cols = df.select_dtypes(include="number").columns[:10].tolist()
+        try:
+            stats = df[numeric_cols].describe().to_string() if numeric_cols else "No numeric columns."
+        except Exception:
+            stats = "No numeric statistics available."
+
+        preview_df = df.iloc[:10, :10]
+        MAX_CONTEXT_CHARS = 3000
         data_context = (
             f"Shape: {df.shape[0]} rows × {df.shape[1]} columns\n"
             f"Columns: {', '.join(df.columns.tolist())}\n\n"
-            f"--- Statistical Summary ---\n{stats}\n\n"
-            f"--- Data Preview (first 20 rows, first 10 columns) ---\n"
+            f"--- Statistical Summary (first 10 numeric columns) ---\n{stats}\n\n"
+            f"--- Data Preview (first 10 rows, first 10 columns) ---\n"
             f"{preview_df.to_string(index=False)}"
         )
         if len(data_context) > MAX_CONTEXT_CHARS:
@@ -357,13 +363,17 @@ async def upload_any(
 
         messages = [
             {"role": "system", "content": FINANCE_ANALYSIS_SYSTEM},
-            {"role": "user",   "content": f"Spreadsheet:\n\n{data_context}\n\n---\nQuestion: {question}"},
+            {"role": "user",   "content": f"Spreadsheet:\n\n{data_context}\n\n---\nQuestion: {question}\n\nKeep your answer concise (under 400 words)."},
         ]
         try:
             answer = _stream_answer(client, model=MODEL_ID, messages=messages,
-                                    max_tokens=4096, temperature=0.3)
+                                    max_tokens=600, temperature=0.3)
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Granite API error: {str(e)}")
+
+        # Hard cap — prevent any oversized response reaching Vercel's Lambda limit
+        if len(answer) > 4000:
+            answer = answer[:4000] + "\n\n[... truncated for size ...]"
 
         return {
             "file": file.filename, "type": "spreadsheet",
