@@ -316,12 +316,21 @@ async def upload_any(
             stats = df.describe().to_string()
         except Exception:
             stats = "No numeric statistics available."
+
+        # With wide files (many columns) the preview explodes in size.
+        # Cap preview to 10 columns and 20 rows, then hard-limit total chars.
+        preview_df = df.iloc[:20, :10]
+        MAX_CONTEXT_CHARS = 6000
         data_context = (
             f"Shape: {df.shape[0]} rows × {df.shape[1]} columns\n"
             f"Columns: {', '.join(df.columns.tolist())}\n\n"
             f"--- Statistical Summary ---\n{stats}\n\n"
-            f"--- Data Preview (first 30 rows) ---\n{df.head(30).to_string(index=False)}"
+            f"--- Data Preview (first 20 rows, first 10 columns) ---\n"
+            f"{preview_df.to_string(index=False)}"
         )
+        if len(data_context) > MAX_CONTEXT_CHARS:
+            data_context = data_context[:MAX_CONTEXT_CHARS] + "\n\n[... truncated ...]"
+
         messages = [
             {"role": "system", "content": FINANCE_ANALYSIS_SYSTEM},
             {"role": "user",   "content": f"Spreadsheet:\n\n{data_context}\n\n---\nQuestion: {question}"},
@@ -333,9 +342,15 @@ async def upload_any(
             )
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Granite API error: {str(e)}")
+
+        msg = response.choices[0].message
+        # Reasoning models (e.g. gpt-oss) may return the answer in reasoning_content
+        # when content is empty.
+        answer = msg.content or getattr(msg, "reasoning_content", None) or ""
+
         return {
             "file": file.filename, "type": "spreadsheet",
-            "answer": response.choices[0].message.content,
+            "answer": answer,
             "model": MODEL_ID, "rows": df.shape[0], "columns": df.columns.tolist(),
             "tokens_used": response.usage.total_tokens if response.usage else None,
         }
