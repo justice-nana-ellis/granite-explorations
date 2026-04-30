@@ -344,14 +344,14 @@ async def upload_any(
             raise HTTPException(status_code=502, detail=f"Granite API error: {str(e)}")
 
         msg = response.choices[0].message
-        # Reasoning models (e.g. gpt-oss) may return the answer in reasoning_content
-        # when content is empty.
+        # Dump every field on the message so we can see where the answer lives
+        # print("DEBUG msg dict:", msg.model_dump() if hasattr(msg, "model_dump") else vars(msg))
         answer = msg.content or getattr(msg, "reasoning_content", None) or ""
 
         return {
             "file": file.filename, "type": "spreadsheet",
             "answer": answer,
-            "model": MODEL_ID, "rows": df.shape[0], "columns": df.columns.tolist(),
+            "model": MODEL_ID, "rows": df.shape[0], "num_columns": df.shape[1],
             "tokens_used": response.usage.total_tokens if response.usage else None,
         }
 
