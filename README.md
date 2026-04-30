@@ -127,7 +127,13 @@ HF_TOKEN=hf_your_token_here
 MODEL_ID=granite3.2:2b
 
 # Model for image / chart endpoints
+# Local Ollama:
 VISION_MODEL_ID=granite3.2-vision:latest
+
+# Railway / cloud vision (recommended):
+# VISION_MODEL_ID=meta-llama/llama-3.2-11b-vision-instruct
+# VISION_API_BASE_URL=https://openrouter.ai/api/v1
+# VISION_API_KEY=sk-or-your-openrouter-key
 ```
 
 ### 5. Pull the models in Ollama
@@ -138,7 +144,7 @@ ollama pull granite3.2:2b        # fastest
 ollama pull granite3.3:latest    # best quality
 ollama pull qwen3:8b             # most accurate overall
 
-# Vision model (for image/chart uploads)
+# Vision model (for image/chart uploads, local Ollama only)
 ollama pull granite3.2-vision:latest
 ```
 

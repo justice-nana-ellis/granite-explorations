@@ -23,6 +23,8 @@ MODEL_ID        = os.getenv("MODEL_ID",        "openai/gpt-oss-20b")
 VISION_MODEL_ID = os.getenv("VISION_MODEL_ID", "granite3.2-vision:latest")
 
 HF_TOKEN = os.getenv("HF_TOKEN")  # required only for HuggingFace models
+VISION_API_BASE_URL = os.getenv("VISION_API_BASE_URL", "").strip()
+VISION_API_KEY = os.getenv("VISION_API_KEY", "").strip()
 
 
 def _is_ollama(model_id: str) -> bool:
@@ -30,8 +32,12 @@ def _is_ollama(model_id: str) -> bool:
     return "/" not in model_id
 
 
-def _missing_client_error(model_id: str) -> Optional[str]:
+def _missing_client_error(model_id: str, *, vision: bool = False) -> Optional[str]:
     if not model_id.strip():
+        return None
+    if vision and VISION_API_BASE_URL and not VISION_API_KEY:
+        return "VISION_API_KEY is required when VISION_API_BASE_URL is set."
+    if vision and VISION_API_BASE_URL:
         return None
     if _is_ollama(model_id):
         return None
@@ -43,18 +49,22 @@ def _missing_client_error(model_id: str) -> Optional[str]:
     return None
 
 
-def _make_client(model_id: str) -> Optional[OpenAI]:
+def _make_client(model_id: str, *, vision: bool = False) -> Optional[OpenAI]:
     if not model_id.strip():
         return None
+    if vision and VISION_API_BASE_URL:
+        if _missing_client_error(model_id, vision=True):
+            return None
+        return OpenAI(base_url=VISION_API_BASE_URL, api_key=VISION_API_KEY)
     if _is_ollama(model_id):
         return OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
-    if _missing_client_error(model_id):
+    if _missing_client_error(model_id, vision=vision):
         return None
     return OpenAI(base_url="https://router.huggingface.co/v1", api_key=HF_TOKEN)
 
 
 client        = _make_client(MODEL_ID)
-vision_client = _make_client(VISION_MODEL_ID)
+vision_client = _make_client(VISION_MODEL_ID, vision=True)
 
 app = FastAPI(
     title="Granite Finance API",
@@ -70,7 +80,7 @@ async def startup():
         if label == "vision" and not mid.strip():
             print("  vision : disabled")
             continue
-        config_error = _missing_client_error(mid)
+        config_error = _missing_client_error(mid, vision=(label == "vision"))
         if config_error:
             errors.append(f"  ⚠  {label}: {config_error}")
             continue
@@ -130,14 +140,14 @@ def _extract_answer(msg) -> str:
     return text
 
 
-def _stream_answer(client_obj, **kwargs) -> str:
+def _stream_answer(client_obj, *, vision: bool = False, **kwargs) -> str:
     """
     Stream a chat completion and discard all tokens inside <think>...</think>.
     This prevents Vercel from buffering the full reasoning chain in memory —
     only the visible answer is accumulated and returned.
     """
     model_id = kwargs.get("model", "unknown")
-    config_error = _missing_client_error(model_id)
+    config_error = _missing_client_error(model_id, vision=vision)
     if client_obj is None or config_error:
         raise RuntimeError(config_error or f"Client for model '{model_id}' is not configured.")
 
@@ -314,7 +324,7 @@ async def upload_any(
             }
         ]
         try:
-            answer = _stream_answer(vision_client, model=VISION_MODEL_ID, messages=messages,
+            answer = _stream_answer(vision_client, vision=True, model=VISION_MODEL_ID, messages=messages,
                                     max_tokens=max_tokens, temperature=0.3)
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Vision model error: {str(e)}")
