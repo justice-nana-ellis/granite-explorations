@@ -2,7 +2,6 @@ import os
 import io
 import base64
 import time
-import tempfile
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from pydantic import BaseModel
@@ -268,19 +267,21 @@ async def upload_any(
         }
 
     elif ext in PDF_EXTS:
-        # ── PDF ─────────────────────────────────────────────────────────
-        from docling.document_converter import DocumentConverter
+        # ── PDF / DOCX ───────────────────────────────────────────────────
         contents = await file.read()
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp.write(contents)
-            tmp_path = tmp.name
         try:
-            result = DocumentConverter().convert(tmp_path)
-            extracted_text = result.document.export_to_markdown()
+            if ext == ".pdf":
+                import pypdf
+                reader = pypdf.PdfReader(io.BytesIO(contents))
+                extracted_text = "\n\n".join(
+                    page.extract_text() or "" for page in reader.pages
+                ).strip()
+            else:  # .docx
+                import docx
+                doc = docx.Document(io.BytesIO(contents))
+                extracted_text = "\n\n".join(p.text for p in doc.paragraphs if p.text).strip()
         except Exception as e:
-            raise HTTPException(status_code=422, detail=f"Could not parse PDF: {str(e)}")
-        finally:
-            os.unlink(tmp_path)
+            raise HTTPException(status_code=422, detail=f"Could not parse file: {str(e)}")
         MAX_CHARS = 8000
         truncated = len(extracted_text) > MAX_CHARS
         if truncated:

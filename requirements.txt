@@ -8,5 +8,7 @@ python-multipart
 # Excel / CSV parsing
 pandas
 openpyxl
-# PDF parsing via IBM Docling
-docling
+# PDF parsing (lightweight — replaces docling/PyTorch)
+pypdf
+# DOCX parsing
+python-docx

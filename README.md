@@ -12,8 +12,6 @@ A locally-running AI API for financial documents, spreadsheets, charts and chat 
 | `POST /analyse` | Financial data or question | Structured analysis with risks |
 | `POST /upload` | Any file + question | AI answer auto-routed by file type |
 | `POST /upload/pdf` | PDF file + question | Answer from extracted text |
-| `POST /upload/excel` | Excel / CSV + question | Answer from computed statistics |
-| `POST /upload/image` | Chart / image + question | Answer from vision model |
 | `GET /health` | — | `{"status": "healthy"}` |
 
 ---
