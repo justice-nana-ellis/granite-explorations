@@ -31,6 +31,8 @@ def _is_ollama(model_id: str) -> bool:
 
 
 def _missing_client_error(model_id: str) -> Optional[str]:
+    if not model_id.strip():
+        return None
     if _is_ollama(model_id):
         return None
     if not HF_TOKEN:
@@ -42,6 +44,8 @@ def _missing_client_error(model_id: str) -> Optional[str]:
 
 
 def _make_client(model_id: str) -> Optional[OpenAI]:
+    if not model_id.strip():
+        return None
     if _is_ollama(model_id):
         return OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
     if _missing_client_error(model_id):
@@ -63,6 +67,9 @@ app = FastAPI(
 async def startup():
     errors = []
     for label, c, mid in [("model", client, MODEL_ID), ("vision", vision_client, VISION_MODEL_ID)]:
+        if label == "vision" and not mid.strip():
+            print("  vision : disabled")
+            continue
         config_error = _missing_client_error(mid)
         if config_error:
             errors.append(f"  ⚠  {label}: {config_error}")
@@ -289,6 +296,11 @@ async def upload_any(
 
     if ext in IMAGE_EXTS:
         # ── Vision ──────────────────────────────────────────────────────
+        if not VISION_MODEL_ID.strip():
+            raise HTTPException(
+                status_code=503,
+                detail="Vision model is disabled for this deployment. Set VISION_MODEL_ID to a supported provider-backed vision model to enable image uploads.",
+            )
         mime = IMAGE_EXTS[ext]
         contents = await file.read()
         b64 = base64.b64encode(contents).decode("utf-8")
