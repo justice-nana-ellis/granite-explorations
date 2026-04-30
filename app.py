@@ -30,14 +30,22 @@ def _is_ollama(model_id: str) -> bool:
     return "/" not in model_id
 
 
-def _make_client(model_id: str) -> OpenAI:
+def _missing_client_error(model_id: str) -> Optional[str]:
+    if _is_ollama(model_id):
+        return None
+    if not HF_TOKEN:
+        return (
+            f"HF_TOKEN is required for HuggingFace model '{model_id}'. "
+            "Set it in your Railway Variables or .env file."
+        )
+    return None
+
+
+def _make_client(model_id: str) -> Optional[OpenAI]:
     if _is_ollama(model_id):
         return OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
-    if not HF_TOKEN:
-        raise RuntimeError(
-            f"HF_TOKEN is required for HuggingFace model '{model_id}'. "
-            "Set it in your .env file."
-        )
+    if _missing_client_error(model_id):
+        return None
     return OpenAI(base_url="https://router.huggingface.co/v1", api_key=HF_TOKEN)
 
 
@@ -55,6 +63,10 @@ app = FastAPI(
 async def startup():
     errors = []
     for label, c, mid in [("model", client, MODEL_ID), ("vision", vision_client, VISION_MODEL_ID)]:
+        config_error = _missing_client_error(mid)
+        if config_error:
+            errors.append(f"  ⚠  {label}: {config_error}")
+            continue
         try:
             c.chat.completions.create(
                 model=mid,
@@ -117,6 +129,11 @@ def _stream_answer(client_obj, **kwargs) -> str:
     This prevents Vercel from buffering the full reasoning chain in memory —
     only the visible answer is accumulated and returned.
     """
+    model_id = kwargs.get("model", "unknown")
+    config_error = _missing_client_error(model_id)
+    if client_obj is None or config_error:
+        raise RuntimeError(config_error or f"Client for model '{model_id}' is not configured.")
+
     inside_think = False
     buffer = ""
     answer_parts = []
