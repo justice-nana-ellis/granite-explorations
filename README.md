@@ -1,220 +1,121 @@
-# Granite Finance API
+# Claude Finance API
 
-A locally-running AI API for financial documents, spreadsheets, charts and chat — powered by IBM Granite (and any other Ollama model) via FastAPI.
-
----
-
-## What it does
-
-| Endpoint | What you send | What you get back |
-|---|---|---|
-| `POST /chat` | A question in JSON | AI answer |
-| `POST /analyse` | Financial data or question | Structured analysis with risks |
-| `POST /upload` | Any file + question | AI answer auto-routed by file type |
-| `POST /upload/pdf` | PDF file + question | Answer from extracted text |
-| `GET /health` | — | `{"status": "healthy"}` |
-
----
-
-## Request Flow
-
-```
-Your HTTP Request
-        │
-        ▼
-  FastAPI receives it
-        │
-        ▼
-  Middleware: start timer ──────────────────────────────────────┐
-        │                                                        │
-        ▼                                                        │
-  Route handler:                                                 │
-        │                                                        │
-        ├─ POST /chat ─────────────────────────────────────┐    │
-        │   Build messages with SYSTEM_PROMPT              │    │
-        │   Send to Ollama (MODEL_ID)                      │    │
-        │   Return { reply, model, tokens_used }           │    │
-        │                                                  │    │
-        ├─ POST /analyse ──────────────────────────────────┤    │
-        │   Build messages with FINANCE_ANALYSIS_SYSTEM    │    │
-        │   Send to Ollama (MODEL_ID) at temp=0.3          │    │
-        │   Return { analysis, model }                     │    │
-        │                                                  │    │
-        └─ POST /upload ───────────────────────────────────┤    │
-            Detect file extension                          │    │
-                │                                          │    │
-                ├─ .png/.jpg/.jpeg/.webp                   │    │
-                │   Encode image as base64                 │    │
-                │   Send to VISION_MODEL_ID                │    │
-                │   Return { answer, model, type:"image" } │    │
-                │                                          │    │
-                ├─ .pdf / .docx                            │    │
-                │   Save to temp file                      │    │
-                │   Docling extracts text + tables         │    │
-                │   Truncate to 8,000 chars if needed      │    │
-                │   Send to MODEL_ID                       │    │
-                │   Delete temp file                       │    │
-                │   Return { answer, model, type:"pdf" }   │    │
-                │                                          │    │
-                └─ .xlsx / .xls / .csv                     │    │
-                    pandas reads file into DataFrame        │    │
-                    Compute .describe() statistics          │    │
-                    Take first 30 rows as preview           │    │
-                    Send context + question to MODEL_ID     │    │
-                    Return { answer, model, type:           │    │
-                             "spreadsheet", columns }       │    │
-                                                            │    │
-        ◄───────────────────────────────────────────────────┘    │
-        │                                                         │
-        ▼                                                         │
-  Middleware: stop timer ◄─────────────────────────────────────────
-  Add X-Response-Time header (ms)
-        │
-        ▼
-  Response back to you
-```
-
----
+A FastAPI server that wraps the Anthropic Claude API for financial document analysis and chat. Supports streaming responses, file uploads (CSV, PDF, images, text), and uses separate models for chat speed vs. analysis quality.
 
 ## Prerequisites
 
-Install these before anything else:
+- Python 3.9+
+- Claude API key from [console.anthropic.com](https://console.anthropic.com/)
 
-1. **Python 3.10+** — [python.org](https://www.python.org/downloads/)
-2. **Ollama** — [ollama.com](https://ollama.com/download)
+## Setup
 
----
-
-## Setup (after cloning)
-
-### 1. Clone the repo
-
-```bash
-git clone https://github.com/YOUR_USERNAME/YOUR_REPO.git
-cd YOUR_REPO
-```
-
-### 2. Create and activate a virtual environment
+### 1. Create virtual environment
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate        # macOS / Linux
-# .venv\Scripts\activate         # Windows
+.venv\Scripts\activate           # Windows
 ```
 
-### 3. Install dependencies
+### 2. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. Set up environment variables
+### 3. Configure environment
 
-```bash
-cp .env.example .env
-```
-
-Open `.env` and set your models:
+Copy `.env.example` or create a `.env` file:
 
 ```ini
-# Optional — only needed if using Hugging Face APIs
-HF_TOKEN=hf_your_token_here
-
-# Model for chat / analyse / document endpoints
-# Fast:    MODEL_ID=granite3.2:2b
-# Quality: MODEL_ID=granite3.3:latest
-# Other:   MODEL_ID=qwen3:8b   or   MODEL_ID=gpt-oss:20b
-MODEL_ID=granite3.2:2b
-
-# Model for image / chart endpoints
-# Local Ollama:
-VISION_MODEL_ID=granite3.2-vision:latest
-
-# Railway / cloud vision (recommended):
-# VISION_MODEL_ID=meta-llama/llama-3.2-11b-vision-instruct
-# VISION_API_BASE_URL=https://openrouter.ai/api/v1
-# VISION_API_KEY=sk-or-your-openrouter-key
+CLAUDE_API_KEY=sk-ant-...
+CLAUDE_MODEL=claude-opus-4-7          # used for file analysis
+CLAUDE_CHAT_MODEL=claude-haiku-4-5-20251001  # used for chat (faster)
+PORT=8000
 ```
 
-### 5. Pull the models in Ollama
+## Running the server
 
 ```bash
-# Text model (pick one)
-ollama pull granite3.2:2b        # fastest
-ollama pull granite3.3:latest    # best quality
-ollama pull qwen3:8b             # most accurate overall
-
-# Vision model (for image/chart uploads, local Ollama only)
-ollama pull granite3.2-vision:latest
+python app.py
 ```
 
-### 6. Start Ollama
-
-On macOS — if you installed the Ollama app it auto-starts. Check with:
-```bash
-ollama ps
-```
-
-If nothing is running:
-```bash
-ollama serve
-```
-
-### 7. Start the API server
+Or with uvicorn directly:
 
 ```bash
-uvicorn app:app --reload
+uvicorn app:app --reload --port 8000
 ```
 
-You should see:
+On startup you will see:
+
 ```
-  model  : granite3.2:2b  ✓
-  vision : granite3.2-vision:latest  ✓
-  server : http://localhost:8000  🚀
+✓ Analysis model : claude-opus-4-7
+✓ Chat model     : claude-haiku-4-5-20251001
+✓ Server running on http://0.0.0.0:8000
 ```
 
----
+## API Routes
 
-## Usage
+### `GET /`
+Health check — returns current model and port.
 
-Open `api.http` in VS Code with the [REST Client](https://marketplace.visualstudio.com/items?itemName=humao.rest-client) extension and click **Send Request** on any example.
+### `GET /health`
+Returns `{"status": "healthy"}`.
 
-Or use curl:
+### `POST /chat`
+Streaming chat with Claude. Response is `text/event-stream` — tokens arrive as they are generated.
 
 ```bash
-# Chat
 curl -X POST http://localhost:8000/chat \
   -H "Content-Type: application/json" \
   -d '{"message": "What is a P/E ratio?"}'
+```
 
-# Upload any file
+Optional field:
+```json
+{
+  "message": "...",
+  "system_prompt": "You are a financial advisor."
+}
+```
+
+### `POST /upload`
+Upload a file and ask a question about it. Response is `text/event-stream` — streams Claude's analysis as it is generated.
+
+```bash
 curl -X POST http://localhost:8000/upload \
-  -F "file=@./report.pdf" \
-  -F "question=What are the key financial highlights?"
+  -F "file=@report.pdf" \
+  -F "question=What is the total AUM?"
 ```
 
-Interactive API docs available at: [http://localhost:8000/docs](http://localhost:8000/docs)
-
----
-
-## Swapping models
-
-Edit `.env` and restart the server — no code changes needed:
-
-```ini
-MODEL_ID=granite3.3:latest
+Optional field:
+```bash
+-F "system_prompt=You are a portfolio analyst."
 ```
 
-Any model in your `ollama list` works.
+#### Supported file types
 
----
+| Type | Handling |
+|---|---|
+| `.csv` | Parsed with pandas — actual totals, means, min/max per numeric column, unique date values, categorical summaries, first 5 rows |
+| `.pdf` | Sent as a base64 document block |
+| `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp` | Sent as a base64 image block |
+| `.txt`, `.html`, `.md` | Sent as inline text |
 
-## Supported file types for `/upload`
+> If the client does not set a `Content-Type` header, the type is inferred from the file extension automatically.
 
-| Extension | Handler | Model used |
+## Models
+
+| Env var | Default | Used for |
 |---|---|---|
-| `.pdf` | IBM Docling (text + table extraction) | `MODEL_ID` |
-| `.docx` | IBM Docling | `MODEL_ID` |
-| `.xlsx` / `.xls` | pandas statistics | `MODEL_ID` |
-| `.csv` | pandas statistics | `MODEL_ID` |
-| `.png` / `.jpg` / `.jpeg` / `.webp` | base64 vision | `VISION_MODEL_ID` |
+| `CLAUDE_MODEL` | `claude-opus-4-7` | File analysis (`/upload`) |
+| `CLAUDE_CHAT_MODEL` | `claude-haiku-4-5-20251001` | Chat (`/chat`) |
+
+Available models:
+- `claude-opus-4-7` — most capable, slower
+- `claude-sonnet-4-6` — balanced
+- `claude-haiku-4-5-20251001` — fastest
+
+## Interactive API docs
+
+Run the server and visit: [http://localhost:8000/docs](http://localhost:8000/docs)
