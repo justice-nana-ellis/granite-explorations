@@ -98,7 +98,7 @@ async def upload_and_ask(
         except UnicodeDecodeError:
             raise HTTPException(status_code=400, detail="CSV file could not be decoded as UTF-8")
 
-        df = pd.read_csv(io.StringIO(text))
+        df = pd.read_csv(io.StringIO(text), low_memory=False)
 
         numeric_cols = df.select_dtypes(include="number").columns.tolist()
         date_cols = [c for c in df.columns if "date" in c.lower()]
