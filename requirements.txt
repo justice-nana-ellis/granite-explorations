@@ -4,3 +4,4 @@ anthropic
 python-dotenv
 pydantic
 pandas
+python-multipart
