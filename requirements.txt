@@ -8,3 +8,5 @@ openpyxl
 python-multipart
 cloudinary
 requests
+python-docx
+python-pptx
