@@ -6,3 +6,5 @@ pydantic
 pandas
 openpyxl
 python-multipart
+cloudinary
+requests

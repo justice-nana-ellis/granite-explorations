@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import base64
@@ -7,7 +8,10 @@ import mimetypes
 from pathlib import Path
 from uuid import uuid4
 from time import time
+import requests
 import pandas as pd
+import cloudinary
+import cloudinary.uploader
 from anthropic import AsyncAnthropic
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse
@@ -16,6 +20,13 @@ from typing import Optional, AsyncIterator
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+    secure=True,
+)
 
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
@@ -44,10 +55,22 @@ SESSION_MAX_COUNT = int(os.getenv("SESSION_MAX_COUNT", 200))        # max concur
 sessions: dict[str, dict] = {}
 
 
+def _delete_cloudinary_file(session: dict) -> None:
+    if not session.get("cloudinary_id"):
+        return
+    try:
+        filename = session.get("file", "")
+        resource_type = "image" if filename.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")) else "raw"
+        cloudinary.uploader.destroy(session["cloudinary_id"], resource_type=resource_type)
+    except Exception:
+        pass
+
+
 def _purge_expired():
     now = time()
     expired = [sid for sid, s in sessions.items() if now - s["last_accessed"] > SESSION_TTL]
     for sid in expired:
+        _delete_cloudinary_file(sessions[sid])
         del sessions[sid]
 
 
@@ -59,9 +82,38 @@ def _get_or_create_session(sid: str, system: str) -> dict:
     if len(sessions) >= SESSION_MAX_COUNT:
         # evict the oldest session
         oldest = min(sessions, key=lambda k: sessions[k]["last_accessed"])
+        _delete_cloudinary_file(sessions[oldest])
         del sessions[oldest]
-    sessions[sid] = {"system": system, "messages": [], "display": [], "file": None, "last_accessed": time()}
+    sessions[sid] = {
+        "system": system,
+        "messages": [],
+        "display": [],
+        "file": None,
+        "cloudinary_id": None,
+        "cloudinary_url": None,
+        "df": None,
+        "df_summary": None,      # cached once on upload, reused on every /chat
+        "last_accessed": time(),
+    }
     return sessions[sid]
+
+
+def _reload_df_from_cloudinary(session: dict) -> None:
+    if not session.get("cloudinary_url") or not session.get("file"):
+        return
+    try:
+        resp = requests.get(session["cloudinary_url"], timeout=30)
+        resp.raise_for_status()
+        raw = resp.content
+        filename: str = session["file"]
+        if filename.endswith(".csv"):
+            session["df"] = pd.read_csv(io.BytesIO(raw), low_memory=False)
+        elif filename.endswith((".xlsx", ".xls")):
+            session["df"] = pd.read_excel(io.BytesIO(raw), engine="openpyxl")
+        if session["df"] is not None:
+            session["df_summary"] = _df_summary(session["df"], filename)
+    except Exception:
+        pass
 
 
 def _session_meta(sid: str) -> dict:
@@ -132,7 +184,17 @@ async def chat(request: ChatRequest):
         rest = session["messages"][1:][-(SESSION_MAX_MESSAGES - 2):]
         session["messages"] = first + rest
 
-    session["messages"].append({"role": "user", "content": request.message})
+    # If df was lost (e.g. server restart), reload it from Cloudinary
+    if session.get("df") is None and session.get("cloudinary_url"):
+        _reload_df_from_cloudinary(session)
+
+    # Prepend the cached file summary so Claude always has the full data context
+    if session.get("df_summary"):
+        message_with_context = f"[File context]\n{session['df_summary']}\n\n[Question]\n{request.message}"
+    else:
+        message_with_context = request.message
+
+    session["messages"].append({"role": "user", "content": message_with_context})
     session["display"].append({"role": "user", "content": request.message})
 
     async def _generate():
@@ -165,13 +227,20 @@ def _df_summary(df: pd.DataFrame, filename: str) -> str:
             uniq = df[dc].dropna().unique()
             lines.append(f"Unique {dc} values ({len(uniq)}): {', '.join(sorted(str(v) for v in uniq))}")
     if numeric_cols:
-        lines.append("\nNumeric column totals:")
+        lines.append("\nNumeric column totals (all rows):")
         for col in numeric_cols:
             col_data = df[col].dropna()
             lines.append(
                 f"  {col}: total={col_data.sum():,.4f}, mean={col_data.mean():,.4f}, "
                 f"min={col_data.min():,.4f}, max={col_data.max():,.4f}, count={len(col_data):,}"
             )
+    if date_cols and numeric_cols:
+        primary_date = date_cols[0]
+        lines.append(f"\nNumeric totals grouped by {primary_date}:")
+        grouped = df.groupby(primary_date)[numeric_cols].sum()
+        for date_val, row in grouped.iterrows():
+            row_parts = ", ".join(f"{col}={row[col]:,.2f}" for col in numeric_cols)
+            lines.append(f"  {date_val}: {row_parts}")
     if cat_cols:
         lines.append("\nCategorical column summaries:")
         for col in cat_cols[:10]:
@@ -200,20 +269,24 @@ async def upload_and_ask(
     if not raw:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
+    parsed_df = None
+
     if content_type == "text/csv":
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
             raise HTTPException(status_code=400, detail="CSV file could not be decoded as UTF-8")
-        df = pd.read_csv(io.StringIO(text), low_memory=False)
-        user_content = [{"type": "text", "text": f"{_df_summary(df, file.filename)}\n\nQuestion: {question}"}]
+        parsed_df = await asyncio.to_thread(pd.read_csv, io.StringIO(text), low_memory=False)
+        summary = await asyncio.to_thread(_df_summary, parsed_df, file.filename)
+        user_content = [{"type": "text", "text": f"{summary}\n\nQuestion: {question}"}]
 
     elif content_type in EXCEL_TYPES:
         try:
-            df = pd.read_excel(io.BytesIO(raw), engine="openpyxl")
+            parsed_df = await asyncio.to_thread(pd.read_excel, io.BytesIO(raw), engine="openpyxl")
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Could not read Excel file: {e}")
-        user_content = [{"type": "text", "text": f"{_df_summary(df, file.filename)}\n\nQuestion: {question}"}]
+        summary = await asyncio.to_thread(_df_summary, parsed_df, file.filename)
+        user_content = [{"type": "text", "text": f"{summary}\n\nQuestion: {question}"}]
 
     elif content_type.startswith("text/"):
         try:
@@ -253,8 +326,30 @@ async def upload_and_ask(
         session["messages"] = first + rest
 
     session["file"] = file.filename
+    if parsed_df is not None:
+        session["df"] = parsed_df
+        session["df_summary"] = summary
+
     session["messages"].append({"role": "user", "content": user_content})
     session["display"].append({"role": "user", "content": question})
+
+    # Upload to Cloudinary in the background — don't block the response
+    async def _upload_to_cloudinary():
+        try:
+            resource_type = "image" if content_type.startswith("image/") else "raw"
+            result = await asyncio.to_thread(
+                cloudinary.uploader.upload,
+                io.BytesIO(raw),
+                public_id=f"sessions/{sid}/{file.filename}",
+                resource_type=resource_type,
+                overwrite=True,
+            )
+            session["cloudinary_id"] = result["public_id"]
+            session["cloudinary_url"] = result["secure_url"]
+        except Exception as e:
+            print(f"Cloudinary upload failed: {e}")
+
+    asyncio.create_task(_upload_to_cloudinary())
 
     async def _generate():
         async for chunk in _stream_and_save(sid, model, 2048):
@@ -267,7 +362,9 @@ async def upload_and_ask(
 
 @app.delete("/session/{session_id}")
 def clear_session(session_id: str):
-    sessions.pop(session_id, None)
+    session = sessions.pop(session_id, None)
+    if session:
+        _delete_cloudinary_file(session)
     return {"cleared": session_id}
 
 
