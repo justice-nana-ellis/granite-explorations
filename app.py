@@ -475,6 +475,17 @@ async def upload_and_ask(
     return StreamingResponse(_generate(), media_type="text/event-stream")
 
 
+# ── Session list ─────────────────────────────────────────────────────
+
+@app.get("/sessions")
+def list_sessions():
+    _purge_expired()
+    return {
+        "count": len(sessions),
+        "sessions": [_session_meta(sid) for sid in sessions],
+    }
+
+
 # ── Session delete ────────────────────────────────────────────────────
 
 @app.delete("/session/{session_id}")
