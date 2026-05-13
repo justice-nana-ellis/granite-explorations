@@ -14,6 +14,7 @@ from docx import Document as DocxDocument
 from pptx import Presentation
 import cloudinary
 import cloudinary.uploader
+import cloudinary.api
 from anthropic import AsyncAnthropic
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse
@@ -484,6 +485,50 @@ def list_sessions():
         "count": len(sessions),
         "sessions": [_session_meta(sid) for sid in sessions],
     }
+
+
+# ── Files list ────────────────────────────────────────────────────────
+
+@app.get("/files")
+async def list_files():
+    """List all files stored in Cloudinary under the sessions/ folder."""
+    try:
+        def _fetch_all():
+            results = []
+            for rtype in ("image", "raw"):
+                next_cursor = None
+                while True:
+                    kwargs = dict(
+                        resource_type=rtype,
+                        type="upload",
+                        prefix="sessions/",
+                        max_results=500,
+                    )
+                    if next_cursor:
+                        kwargs["next_cursor"] = next_cursor
+                    resp = cloudinary.api.resources(**kwargs)
+                    results.extend(resp.get("resources", []))
+                    next_cursor = resp.get("next_cursor")
+                    if not next_cursor:
+                        break
+            return results
+
+        all_resources = await asyncio.to_thread(_fetch_all)
+        files = [
+            {
+                "public_id": r["public_id"],
+                "url": r["secure_url"],
+                "bytes": r["bytes"],
+                "format": r.get("format") or os.path.splitext(r["public_id"])[-1].lstrip(".") or "unknown",
+                "resource_type": r.get("resource_type"),
+                "created_at": r.get("created_at"),
+            }
+            for r in all_resources
+            if not r["public_id"].endswith("state.json")
+        ]
+        return {"count": len(files), "files": files}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cloudinary error: {e}")
 
 
 # ── Session delete ────────────────────────────────────────────────────
