@@ -1704,11 +1704,247 @@ async def render_first_artifact(session_id: str):
 
 # ── /allChat ─ full dashboard, JSX scaffold, shareable links ─────────
 
-class AllChatRequest(BaseModel):
-    message: str
-    session_id: Optional[str] = None
-    system_prompt: Optional[str] = None
-    response_format: Optional[str] = None  # "html" (default) | "json"
+@app.post("/allChat")
+async def all_chat(
+    question: str = Form(...),
+    session_id: Optional[str] = Form(None),
+    system_prompt: Optional[str] = Form(None),
+    response_format: Optional[str] = Form(None),
+    files: Optional[list[UploadFile]] = File(None),
+    file: Optional[UploadFile] = File(None),
+    http_request: Request = None,
+):
+    """
+    All-in-one endpoint: upload files + ask a question, get a full dashboard
+    with AI analysis, interactive Chart.js charts, Cloudinary PNG artifacts,
+    forecast, JSX scaffold, and shareable links — all in a single response.
+    
+    Accepts EITHER:
+    - Single file via 'file' parameter (like /upload)
+    - Multiple files via 'files' parameter
+    
+    
+    Usage:
+    - With files (multipart/form-data):
+      POST /allChat with files[], question, optional session_id, system_prompt
+    
+    - Without files (multipart/form-data):
+      POST /allChat with question and optional session_id (uses existing session)
+    
+    Response format:
+    - Default: HTML dashboard
+    - ?response_format=json: Structured JSON bundle
+    """
+    sid = session_id or str(uuid4())
+    session = _get_or_create_session(sid, system_prompt or ANALYSIS_SYSTEM_PROMPT)
+    _trim_messages(session)
+
+    # Validate question is not empty
+    if not question or not question.strip():
+        raise HTTPException(status_code=400, detail="Question is required")
+
+    # Normalize: convert single file to files list if provided
+    if file and (files is None or len(files) == 0):
+        files = [file]
+
+    # ─── Process uploaded files if any ─────────────────────────────────
+    if files and len(files) > 0:
+        if len(files) > 10:
+            raise HTTPException(status_code=400, detail="Maximum 10 files per request")
+
+        file_summaries = []
+        primary_df = None
+
+        for idx, file in enumerate(files):
+            if not file.filename:
+                continue
+
+            content_type = _normalized_content_type(file)
+            raw = await file.read()
+
+            if not raw:
+                file_summaries.append(f"[File {idx + 1}: {file.filename}] — empty, skipped")
+                continue
+
+            parsed_df = None
+            summary = None
+
+            # Parse file
+            if content_type == "text/csv":
+                try:
+                    text = raw.decode("utf-8")
+                    parsed_df = await asyncio.to_thread(pd.read_csv, io.StringIO(text), low_memory=False)
+                    summary = await asyncio.to_thread(_df_summary, parsed_df, file.filename)
+                except Exception as e:
+                    summary = f"[File {idx + 1}: {file.filename}] — CSV error: {str(e)[:100]}"
+
+            elif content_type in EXCEL_TYPES:
+                try:
+                    parsed_df = await asyncio.to_thread(pd.read_excel, io.BytesIO(raw), engine="openpyxl")
+                    summary = await asyncio.to_thread(_df_summary, parsed_df, file.filename)
+                except Exception as e:
+                    summary = f"[File {idx + 1}: {file.filename}] — Excel error: {str(e)[:100]}"
+
+            elif content_type in WORD_TYPES:
+                try:
+                    text_content = await asyncio.to_thread(_extract_docx, raw)
+                    summary = f"[File {idx + 1}: {file.filename} (DOCX)]\n{text_content[:1500]}"
+                except Exception as e:
+                    summary = f"[File {idx + 1}: {file.filename}] — DOCX error: {str(e)[:100]}"
+
+            elif content_type in PPTX_TYPES:
+                try:
+                    text_content = await asyncio.to_thread(_extract_pptx, raw)
+                    summary = f"[File {idx + 1}: {file.filename} (PPTX)]\n{text_content[:1500]}"
+                except Exception as e:
+                    summary = f"[File {idx + 1}: {file.filename}] — PPTX error: {str(e)[:100]}"
+
+            elif content_type.startswith("text/"):
+                try:
+                    text_content = raw.decode("utf-8")
+                    summary = f"[File {idx + 1}: {file.filename} (Text)]\n{text_content[:1500]}"
+                except Exception as e:
+                    summary = f"[File {idx + 1}: {file.filename}] — Text error: {str(e)[:100]}"
+
+            elif content_type in ("image/jpeg", "image/png", "image/gif", "image/webp"):
+                summary = f"[File {idx + 1}: {file.filename}] Image file ({content_type})"
+
+            elif content_type == "application/pdf":
+                summary = f"[File {idx + 1}: {file.filename}] PDF document"
+
+            else:
+                summary = f"[File {idx + 1}: {file.filename}] Unsupported type: {content_type}"
+
+            if summary:
+                file_summaries.append(summary)
+
+            # Use first CSV/Excel for charting
+            if parsed_df is not None and primary_df is None:
+                primary_df = parsed_df
+                session["df"] = parsed_df
+                session["df_summary"] = summary
+                session["file"] = file.filename
+                session["file_content_type"] = content_type
+                session["file_raw"] = raw  # Store raw for later image/PDF handling
+            elif primary_df is None:
+                # For first file (even if not tabular), store metadata for session
+                session["file"] = file.filename
+                session["file_content_type"] = content_type
+                session["file_raw"] = raw
+                if content_type in WORD_TYPES or content_type in PPTX_TYPES or content_type.startswith("text/"):
+                    session["file_summary"] = summary
+
+
+            # Background Cloudinary upload
+            async def _bg_upload(raw, fname, ctype):
+                rtype = "image" if ctype.startswith("image/") else "raw"
+                try:
+                    result = await asyncio.to_thread(
+                        cloudinary.uploader.upload,
+                        io.BytesIO(raw),
+                        public_id=f"sessions/{sid}/{fname}",
+                        resource_type=rtype,
+                        overwrite=True,
+                    )
+                    if session.get("file") == fname:
+                        session["cloudinary_id"] = result["public_id"]
+                        session["cloudinary_url"] = result["secure_url"]
+                except Exception as e:
+                    print(f"Cloudinary upload failed for {fname}: {e}")
+
+            asyncio.create_task(_bg_upload(raw, file.filename, content_type))
+
+        # Build message with file contexts
+        combined_context = "\n\n".join(file_summaries) if file_summaries else "Files processed."
+        msg_content = f"[Uploaded Files]\n{combined_context}\n\n[User Question]\n{question}"
+        filename_display = f"{len(files)} file(s)"
+
+    else:
+        # ─── No files: use existing session + question ───────────────────
+        if session.get("df") is None and session.get("cloudinary_url"):
+            await asyncio.to_thread(_reload_df_from_cloudinary, session)
+
+        ct = session.get("file_content_type", "")
+        if session.get("df_summary"):
+            msg_content = f"[File context]\n{session['df_summary']}\n\n[Question]\n{question}"
+        elif ct in ("image/jpeg", "image/png", "image/gif", "image/webp") and session.get("file_raw"):
+            enc = base64.standard_b64encode(session["file_raw"]).decode("utf-8")
+            msg_content = [
+                {"type": "image", "source": {"type": "base64", "media_type": ct, "data": enc}},
+                {"type": "text", "text": question},
+            ]
+        elif ct == "application/pdf" and session.get("file_raw"):
+            enc = base64.standard_b64encode(session["file_raw"]).decode("utf-8")
+            msg_content = [
+                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": enc}},
+                {"type": "text", "text": question},
+            ]
+        elif session.get("file_summary"):
+            msg_content = f"[File context]\n{session['file_summary']}\n\n[Question]\n{question}"
+        else:
+            msg_content = question
+
+        filename_display = session.get("file") or "Chat Session"
+
+    session["messages"].append({"role": "user", "content": msg_content})
+    session["display"].append({"role": "user", "content": question})
+
+    # Run AI analysis
+    ai_response = await client.messages.create(
+        model=chat_model,
+        max_tokens=4096,
+        system=session["system"],
+        messages=session["messages"],
+    )
+    analysis_text = _extract_assistant_text(ai_response)
+    session["messages"].append({"role": "assistant", "content": analysis_text})
+    session["display"].append({"role": "assistant", "content": analysis_text})
+
+    # Build visuals if tabular data present
+    artifacts: list = []
+    forecast: Optional[dict] = None
+    if session.get("df") is not None:
+        try:
+            artifacts = await _build_visual_artifacts(sid, session, chart_type="auto", max_charts=6)
+        except Exception:
+            artifacts = []
+        try:
+            forecast = await _build_forecast_artifact(sid, session)
+        except Exception:
+            forecast = None
+
+    sessions[sid]["last_accessed"] = time()
+    asyncio.create_task(_save_state_to_cloudinary(sid, session))
+
+    base_url = str(http_request.base_url).rstrip("/") if http_request else "http://localhost:8000"
+    wants_json = (response_format or "").lower() in {"json", "bundle"}
+
+    if wants_json:
+        return {
+            "session_id": sid,
+            "file": session.get("file"),
+            "analysis": analysis_text,
+            "artifacts": artifacts,
+            "forecast": forecast,
+            "links": {
+                "dashboard": f"{base_url}/dashboard/{sid}/render",
+                "artifacts": f"{base_url}/artifacts/{sid}",
+                "forecast": f"{base_url}/forecast/{sid}",
+                "visualize": f"{base_url}/visualize/{sid}",
+            },
+        }
+
+    html_content = _build_allchat_html(
+        sid=sid,
+        filename=filename_display,
+        question=question,
+        analysis=analysis_text,
+        artifacts=artifacts,
+        forecast=forecast,
+        session=session,
+        base_url=base_url,
+    )
+    return HTMLResponse(content=html_content)
 
 
 def _build_allchat_html(
@@ -1845,7 +2081,7 @@ def _build_allchat_html(
 <head>
 <meta charset='utf-8'/>
 <meta name='viewport' content='width=device-width,initial-scale=1'/>
-<title>{safe_file} — allChat Dashboard</title>
+<title>{safe_file} — Generalli Ai Dashboard</title>
 <script src='https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js'></script>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
@@ -1994,101 +2230,8 @@ function copyLink(url,btn){{
 </html>"""
 
 
-@app.post("/allChat")
-async def all_chat(request: AllChatRequest, http_request: Request):
-    """
-    All-in-one endpoint: runs AI analysis, generates interactive Chart.js charts,
-    Cloudinary PNG artifact cards (click-to-open), a forecast, a copyable JSX
-    component, and a shareable link panel — all in a single HTML response.
+# ── /allChat-upload ─ multi-file upload → full dashboard in one shot ───
 
-    Pass response_format='json' to get a structured JSON bundle instead.
-    """
-    sid = request.session_id or str(uuid4())
-    session = _get_or_create_session(sid, request.system_prompt or ANALYSIS_SYSTEM_PROMPT)
-    _trim_messages(session)
-
-    if session.get("df") is None and session.get("cloudinary_url"):
-        await asyncio.to_thread(_reload_df_from_cloudinary, session)
-
-    # Build user message with any file context
-    ct = session.get("file_content_type", "")
-    if session.get("df_summary"):
-        msg_content = f"[File context]\n{session['df_summary']}\n\n[Question]\n{request.message}"
-    elif ct in ("image/jpeg", "image/png", "image/gif", "image/webp") and session.get("file_raw"):
-        enc = base64.standard_b64encode(session["file_raw"]).decode("utf-8")
-        msg_content = [
-            {"type": "image", "source": {"type": "base64", "media_type": ct, "data": enc}},
-            {"type": "text", "text": request.message},
-        ]
-    elif ct == "application/pdf" and session.get("file_raw"):
-        enc = base64.standard_b64encode(session["file_raw"]).decode("utf-8")
-        msg_content = [
-            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": enc}},
-            {"type": "text", "text": request.message},
-        ]
-    elif session.get("file_summary"):
-        msg_content = f"[File context]\n{session['file_summary']}\n\n[Question]\n{request.message}"
-    else:
-        msg_content = request.message
-
-    session["messages"].append({"role": "user", "content": msg_content})
-    session["display"].append({"role": "user", "content": request.message})
-
-    ai_response = await client.messages.create(
-        model=chat_model,
-        max_tokens=4096,
-        system=session["system"],
-        messages=session["messages"],
-    )
-    analysis_text = _extract_assistant_text(ai_response)
-    session["messages"].append({"role": "assistant", "content": analysis_text})
-    session["display"].append({"role": "assistant", "content": analysis_text})
-
-    # Build visuals if tabular data is present
-    artifacts: list = []
-    forecast: Optional[dict] = None
-    if session.get("df") is not None:
-        try:
-            artifacts = await _build_visual_artifacts(sid, session, chart_type="auto", max_charts=6)
-        except Exception:
-            artifacts = []
-        try:
-            forecast = await _build_forecast_artifact(sid, session)
-        except Exception:
-            forecast = None
-
-    sessions[sid]["last_accessed"] = time()
-    asyncio.create_task(_save_state_to_cloudinary(sid, session))
-
-    base_url = str(http_request.base_url).rstrip("/")
-    wants_json = (request.response_format or "").lower() in {"json", "bundle"}
-
-    if wants_json:
-        return {
-            "session_id": sid,
-            "file": session.get("file"),
-            "analysis": analysis_text,
-            "artifacts": artifacts,
-            "forecast": forecast,
-            "links": {
-                "dashboard": f"{base_url}/dashboard/{sid}/render",
-                "artifacts": f"{base_url}/artifacts/{sid}",
-                "forecast": f"{base_url}/forecast/{sid}",
-                "visualize": f"{base_url}/visualize/{sid}",
-            },
-        }
-
-    html_content = _build_allchat_html(
-        sid=sid,
-        filename=session.get("file") or "Chat Session",
-        question=request.message,
-        analysis=analysis_text,
-        artifacts=artifacts,
-        forecast=forecast,
-        session=session,
-        base_url=base_url,
-    )
-    return HTMLResponse(content=html_content)
 
 
 if __name__ == "__main__":
