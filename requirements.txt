@@ -10,3 +10,4 @@ cloudinary
 requests
 python-docx
 python-pptx
+matplotlib
