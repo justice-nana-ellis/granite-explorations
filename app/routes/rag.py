@@ -28,7 +28,7 @@ def _sse(data: dict) -> str:
 
 class RagQueryRequest(BaseModel):
     msg: str
-    rag_id: str
+    rag_ids: list[str]
     top_k: int = 15
     max_tokens: int = 1024
     temperature: float = 0.7
@@ -183,33 +183,55 @@ async def rag_ingest(
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
-# ── Query (single rag_id) ──────────────────────────────────────────────────────
+# ── Query (one or more rag_ids, plain JSON response) ──────────────────────────
 
 @router.post("/query")
 async def rag_query(body: RagQueryRequest):
-    """Ask a question against a single rag_id."""
+    """Ask a question against one or more rag_ids. Returns a plain JSON response."""
     if not body.msg.strip():
         raise HTTPException(status_code=400, detail="msg is required.")
+    if not body.rag_ids:
+        raise HTTPException(status_code=400, detail="At least one rag_id is required.")
 
     try:
-        analysis, rows = await rag_service.rag_query(
+        all_rows, context = await rag_service.rag_retrieve_multi(
             question=body.msg,
-            rag_id=body.rag_id,
+            rag_ids=body.rag_ids,
             top_k=body.top_k,
-            max_tokens=body.max_tokens,
-            temperature=body.temperature,
-            system_prompt=body.system_prompt,
         )
     except Exception as exc:
-        logger.exception("RAG query failed for rag_id %s", body.rag_id)
+        logger.exception("RAG query retrieve failed for rag_ids %s", body.rag_ids)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    system = body.system_prompt or (
+        "You are a precise data analyst. Answer using only the provided data rows. "
+        "Be specific, cite exact numbers, and highlight key trends."
+    )
+    messages = [{
+        "role": "user",
+        "content": f"[Relevant data rows]\n{context}\n\n[Question]\n{body.msg}",
+    }]
+
+    try:
+        from app.services.claude_service import claude_service
+        from app.config import settings
+        analysis = await claude_service.complete(
+            messages,
+            system=system,
+            model=settings.claude_chat_model,
+            max_tokens=body.max_tokens,
+            temperature=body.temperature,
+        )
+    except Exception as exc:
+        logger.exception("RAG query Claude call failed for rag_ids %s", body.rag_ids)
         raise HTTPException(status_code=500, detail=str(exc))
 
     return {
-        "rag_id": body.rag_id,
+        "rag_ids": body.rag_ids,
         "question": body.msg,
         "analysis": analysis,
-        "retrieved_rows": len(rows),
-        "sources": rows[:5],
+        "retrieved_rows": len(all_rows),
+        "sources": all_rows[:5],
     }
 
 
@@ -302,15 +324,27 @@ async def rag_list_ids():
     return {"rag_ids": sessions, "count": len(sessions)}
 
 
-@router.get("/{rag_id}/files")
+@router.get("/{rag_id}")
 async def rag_list_files(rag_id: str):
-    """List all files inside a rag_id with row counts."""
+    """Return the RAG and all its ingested files with row counts."""
     try:
         files = await rag_service.list_rag_files(rag_id)
     except Exception as exc:
         logger.exception("RAG list files failed for rag_id %s", rag_id)
         raise HTTPException(status_code=500, detail=str(exc))
-    return {"rag_id": rag_id, "files": files, "count": len(files)}
+
+    total_rows = sum(f.get("row_count", 0) for f in files)
+    return {
+        "rag_id": rag_id,
+        "total_files": len(files),
+        "total_rows": total_rows,
+        "files": files,
+        "message": (
+            f"RAG '{rag_id}' contains {len(files)} file(s) with {total_rows:,} total rows."
+            if files else
+            f"RAG '{rag_id}' has no ingested files."
+        ),
+    }
 
 
 @router.delete("/{rag_id}/file/{filename}")
