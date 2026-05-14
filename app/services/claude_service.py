@@ -27,14 +27,18 @@ class ClaudeService:
         system: str,
         model: str | None = None,
         max_tokens: int = 1024,
+        temperature: float | None = None,
     ) -> AsyncIterator[str]:
         use_model = model or settings.claude_chat_model
-        async with get_client().messages.stream(
+        kwargs = dict(
             model=use_model,
             max_tokens=max_tokens,
             system=system,
             messages=messages,
-        ) as stream:
+        )
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        async with get_client().messages.stream(**kwargs) as stream:
             async for text in stream.text_stream:
                 yield text
 

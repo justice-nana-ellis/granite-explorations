@@ -30,7 +30,6 @@ EMBED_BATCH    = 256
 INSERT_BATCH   = 500
 
 _pg_conn        = None
-_sb_client      = None
 _local_model    = None
 
 
@@ -69,7 +68,7 @@ def _get_pg_conn():
     return _pg_conn
 
 
-async def _pg_ingest(session_id: str, filename: str,
+async def _pg_ingest(rag_id: str, filename: str,
                      contents: list[str], metadatas: list[dict],
                      embeddings: list[list[float]]) -> None:
     from psycopg2.extras import execute_values
@@ -85,7 +84,7 @@ async def _pg_ingest(session_id: str, filename: str,
             VALUES %s
             """,
             [
-                (session_id, filename, contents[i],
+                (rag_id, filename, contents[i],
                  json.dumps(metadatas[i]), np.array(embeddings[i]))
                 for i in range(len(contents))
             ],
@@ -95,7 +94,7 @@ async def _pg_ingest(session_id: str, filename: str,
     await asyncio.to_thread(_run)
 
 
-async def _pg_retrieve(session_id: str, qvec: list[float], top_k: int) -> list[dict]:
+async def _pg_retrieve(rag_id: str, qvec: list[float], top_k: int) -> list[dict]:
     def _run():
         conn = _get_pg_conn()
         cur  = conn.cursor()
@@ -108,7 +107,7 @@ async def _pg_retrieve(session_id: str, qvec: list[float], top_k: int) -> list[d
             ORDER  BY embedding <=> %s
             LIMIT  %s
             """,
-            (np.array(qvec), session_id, np.array(qvec), top_k),
+            (np.array(qvec), rag_id, np.array(qvec), top_k),
         )
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
@@ -116,12 +115,18 @@ async def _pg_retrieve(session_id: str, qvec: list[float], top_k: int) -> list[d
     return await asyncio.to_thread(_run)
 
 
-async def _pg_delete(session_id: str) -> None:
+async def _pg_delete(rag_id: str) -> None:
     def _run():
         conn = _get_pg_conn()
         cur  = conn.cursor()
-        cur.execute("DELETE FROM rag_documents WHERE session_id = %s", (session_id,))
-        conn.commit()
+        try:
+            cur.execute("DELETE FROM rag_documents WHERE session_id = %s", (rag_id,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
 
     await asyncio.to_thread(_run)
 
@@ -129,20 +134,20 @@ async def _pg_delete(session_id: str) -> None:
 # ── Supabase REST client ───────────────────────────────────────────────────────
 
 def _get_sb_client():
-    global _sb_client
-    if _sb_client is None:
-        from supabase import create_client
-        _sb_client = create_client(settings.supabase_url, settings.supabase_key)
-    return _sb_client
+    # Always create a fresh client — the httpx session inside supabase-py is not
+    # thread-safe, so sharing one instance across asyncio.to_thread calls causes
+    # [Errno 35] ReadErrors when concurrent requests hit the same HTTP/2 connection.
+    from supabase import create_client
+    return create_client(settings.supabase_url, settings.supabase_key)
 
 
-async def _sb_ingest(session_id: str, filename: str,
+async def _sb_ingest(rag_id: str, filename: str,
                      contents: list[str], metadatas: list[dict],
                      embeddings: list[list[float]]) -> None:
     sb = _get_sb_client()
     records = [
         {
-            "session_id": session_id,
+            "session_id": rag_id,   # DB column is session_id
             "filename":   filename,
             "content":    contents[i],
             "metadata":   metadatas[i],
@@ -157,23 +162,58 @@ async def _sb_ingest(session_id: str, filename: str,
         )
 
 
-async def _sb_retrieve(session_id: str, qvec: list[float], top_k: int) -> list[dict]:
+async def _sb_retrieve(rag_id: str, qvec: list[float], top_k: int) -> list[dict]:
     sb = _get_sb_client()
     result = await asyncio.to_thread(
         lambda: sb.rpc("match_rag_documents", {
             "query_embedding": qvec,
-            "p_session_id":    session_id,
+            "p_session_id":    rag_id,
             "match_count":     top_k,
         }).execute()
     )
     return result.data or []
 
 
-async def _sb_delete(session_id: str) -> None:
-    sb = _get_sb_client()
-    await asyncio.to_thread(
-        lambda: sb.table("rag_documents").delete().eq("session_id", session_id).execute()
-    )
+async def _sb_batch_delete(
+    filters: dict,
+    batch_size: int = 200,
+    progress_callback=None,  # optional async callable(deleted_so_far: int, message: str)
+) -> int:
+    """Delete rows matching filters in small batches.
+
+    Each batch is a separate asyncio.to_thread call so the async progress_callback
+    can be awaited between batches — safe for any dataset size.
+    """
+    deleted = 0
+    while True:
+        def _fetch(f=filters):
+            sb    = _get_sb_client()
+            query = sb.table("rag_documents").select("id").limit(batch_size)
+            for col, val in f.items():
+                query = query.eq(col, val)
+            return [r["id"] for r in (query.execute().data or [])]
+
+        ids = await asyncio.to_thread(_fetch)
+        if not ids:
+            break
+
+        def _delete(chunk=ids):
+            sb = _get_sb_client()
+            sb.table("rag_documents").delete().in_("id", chunk).execute()
+
+        await asyncio.to_thread(_delete)
+        deleted += len(ids)
+
+        msg = f"Deleted {deleted:,} rows so far…"
+        logger.info("RAG batch delete — %s", msg)
+        if progress_callback:
+            await progress_callback(deleted, msg)
+
+    return deleted
+
+
+async def _sb_delete(rag_id: str, progress_callback=None) -> None:
+    await _sb_batch_delete({"session_id": rag_id}, progress_callback=progress_callback)
 
 
 # ── Embeddings ─────────────────────────────────────────────────────────────────
@@ -249,12 +289,23 @@ def _to_native(v):
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-async def ingest_df(df: pd.DataFrame, session_id: str, filename: str) -> int:
-    """Embed and store every row. Streams in batches — safe for 800K+ rows."""
+async def ingest_df(
+    df: pd.DataFrame,
+    rag_id: str,
+    filename: str,
+    progress_callback=None,  # optional async callable(msg: str)
+) -> int:
+    """Embed and store every row. Streams in batches — safe for 800K+ rows.
+
+    If progress_callback is provided it is awaited after every batch so the
+    caller can relay live progress (e.g. SSE stream) while the terminal logs
+    continue as normal.
+    """
     backend     = _backend()
     rows_iter   = df.iterrows()
     exhausted   = False
     total       = 0
+    total_rows  = len(df)
 
     while not exhausted:
         contents:  list[str]  = []
@@ -276,37 +327,40 @@ async def ingest_df(df: pd.DataFrame, session_id: str, filename: str) -> int:
         embeddings = await _embed(contents)
 
         if backend == "postgres":
-            await _pg_ingest(session_id, filename, contents, metadatas, embeddings)
+            await _pg_ingest(rag_id, filename, contents, metadatas, embeddings)
         else:
-            await _sb_ingest(session_id, filename, contents, metadatas, embeddings)
+            await _sb_ingest(rag_id, filename, contents, metadatas, embeddings)
 
         total += len(contents)
-        logger.info("RAG ingestion: %d / %d rows…", total, len(df))
+        msg = f"[{filename}] {total:,} / {total_rows:,} rows ingested…"
+        logger.info("RAG ingestion progress — %s", msg)
+        if progress_callback:
+            await progress_callback(msg)
 
-    logger.info("RAG ingestion complete: %d rows — session=%s backend=%s", total, session_id, backend)
+    logger.info("RAG ingestion complete: %d rows — rag_id=%s backend=%s", total, rag_id, backend)
     return total
 
 
-async def retrieve(question: str, session_id: str, top_k: int = 15) -> list[dict]:
+async def retrieve(question: str, rag_id: str, top_k: int = 15) -> list[dict]:
     """Embed question, return top-K most similar rows."""
     [qvec]  = await _embed([question])
     backend = _backend()
 
     if backend == "postgres":
-        return await _pg_retrieve(session_id, qvec, top_k)
-    return await _sb_retrieve(session_id, qvec, top_k)
+        return await _pg_retrieve(rag_id, qvec, top_k)
+    return await _sb_retrieve(rag_id, qvec, top_k)
 
 
 async def rag_query(
     question: str,
-    session_id: str,
+    rag_id: str,
     top_k: int = 15,
     max_tokens: int = 1024,
     temperature: float = 0.7,
     system_prompt: str | None = None,
 ) -> tuple[str, list[dict]]:
     """Full RAG pipeline: vector search → context → Claude analysis."""
-    rows    = await retrieve(question, session_id, top_k=top_k)
+    rows    = await retrieve(question, rag_id, top_k=top_k)
     context = "\n".join(r["content"] for r in rows) if rows else "No relevant data found."
 
     from app.services.claude_service import claude_service
@@ -329,11 +383,214 @@ async def rag_query(
     return analysis, rows
 
 
-async def delete_session_data(session_id: str) -> None:
-    """Remove all ingested rows for a session."""
+async def rag_retrieve_multi(
+    question: str,
+    rag_ids: list[str],
+    top_k: int = 10,
+) -> tuple[list[dict], str]:
+    """Retrieve rows from multiple rag_ids in parallel.
+
+    Returns (all_rows, context_string) without calling Claude — lets the
+    caller stream the LLM response independently.
+    """
+    results = await asyncio.gather(
+        *[retrieve(question, rid, top_k=top_k) for rid in rag_ids],
+        return_exceptions=True,
+    )
+    all_rows: list[dict] = []
+    for rid, result in zip(rag_ids, results):
+        if isinstance(result, Exception):
+            logger.warning("RAG retrieve failed for rag_id=%s: %s", rid, result)
+            continue
+        for row in result:
+            row["rag_id"] = rid
+        all_rows.extend(result)
+    all_rows.sort(key=lambda r: r.get("similarity") or 0, reverse=True)
+    context = "\n".join(r["content"] for r in all_rows) if all_rows else "No relevant data found."
+    return all_rows, context
+
+
+async def rag_chat_multi(
+    question: str,
+    rag_ids: list[str],
+    top_k: int = 10,
+    max_tokens: int = 1024,
+    temperature: float = 0.7,
+    system_prompt: str | None = None,
+) -> tuple[str, list[dict]]:
+    """Retrieve from multiple rag_ids in parallel, combine, then send to Claude."""
+    # Embed question once, retrieve from all rag_ids concurrently
+    results = await asyncio.gather(
+        *[retrieve(question, rid, top_k=top_k) for rid in rag_ids],
+        return_exceptions=True,
+    )
+
+    all_rows: list[dict] = []
+    for rid, result in zip(rag_ids, results):
+        if isinstance(result, Exception):
+            logger.warning("RAG retrieve failed for rag_id=%s: %s", rid, result)
+            continue
+        for row in result:
+            row["rag_id"] = rid   # tag each row with its source
+        all_rows.extend(result)
+
+    # Sort combined rows by similarity descending
+    all_rows.sort(key=lambda r: r.get("similarity") or 0, reverse=True)
+
+    context = "\n".join(r["content"] for r in all_rows) if all_rows else "No relevant data found."
+
+    from app.services.claude_service import claude_service
+
+    system = system_prompt or (
+        "You are a precise data analyst. Answer using only the provided data rows. "
+        "Be specific, cite exact numbers, and highlight key trends."
+    )
+    messages = [{
+        "role": "user",
+        "content": f"[Relevant data rows]\n{context}\n\n[Question]\n{question}",
+    }]
+    analysis = await claude_service.complete(
+        messages,
+        system=system,
+        model=settings.claude_chat_model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
+    return analysis, all_rows
+
+
+async def delete_rag_data(rag_id: str, progress_callback=None) -> None:
+    """Remove all ingested rows for a rag_id."""
     backend = _backend()
     if backend == "postgres":
-        await _pg_delete(session_id)
+        await _pg_delete(rag_id)
     else:
-        await _sb_delete(session_id)
-    logger.info("RAG: deleted all rows for session=%s backend=%s", session_id, backend)
+        await _sb_delete(rag_id, progress_callback=progress_callback)
+    logger.info("RAG: deleted all rows for rag_id=%s backend=%s", rag_id, backend)
+
+
+async def list_rag_files(rag_id: str) -> list[dict]:
+    """List all files ingested under a rag_id with row counts."""
+    backend = _backend()
+
+    if backend == "postgres":
+        def _run():
+            conn = _get_pg_conn()
+            cur  = conn.cursor()
+            cur.execute(
+                """
+                SELECT filename,
+                       COUNT(*)        AS row_count,
+                       MIN(created_at) AS ingested_at
+                FROM   rag_documents
+                WHERE  session_id = %s
+                GROUP  BY filename
+                ORDER  BY MIN(created_at)
+                """,
+                (rag_id,),
+            )
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+        return await asyncio.to_thread(_run)
+
+    else:
+        sb = _get_sb_client()
+        result = await asyncio.to_thread(
+            lambda: sb.table("rag_documents")
+                .select("filename, created_at")
+                .eq("session_id", rag_id)
+                .execute()
+        )
+        rows = result.data or []
+        counts: dict[str, dict] = {}
+        for r in rows:
+            fname = r["filename"]
+            if fname not in counts:
+                counts[fname] = {"filename": fname, "row_count": 0, "ingested_at": r["created_at"]}
+            counts[fname]["row_count"] += 1
+        return list(counts.values())
+
+
+async def delete_rag_file(rag_id: str, filename: str, progress_callback=None) -> int:
+    """Delete all rows for a specific file within a rag_id. Returns deleted count."""
+    backend = _backend()
+
+    if backend == "postgres":
+        def _run():
+            conn = _get_pg_conn()
+            cur  = conn.cursor()
+            try:
+                cur.execute(
+                    "DELETE FROM rag_documents WHERE session_id = %s AND filename = %s",
+                    (rag_id, filename),
+                )
+                count = cur.rowcount
+                conn.commit()
+                return count
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                cur.close()
+        count = await asyncio.to_thread(_run)
+
+    else:
+        count = await _sb_batch_delete(
+            {"session_id": rag_id, "filename": filename},
+            progress_callback=progress_callback,
+        )
+
+    logger.info("RAG: deleted %d rows for file=%s rag_id=%s", count, filename, rag_id)
+    return count
+
+
+async def list_all_rags() -> list[dict]:
+    """List every rag_id with its files and total row count."""
+    backend = _backend()
+
+    if backend == "postgres":
+        def _run():
+            conn = _get_pg_conn()
+            cur  = conn.cursor()
+            cur.execute(
+                """
+                SELECT session_id          AS rag_id,
+                       COUNT(DISTINCT filename) AS file_count,
+                       COUNT(*)                 AS total_rows,
+                       MIN(created_at)          AS created_at,
+                       MAX(created_at)          AS last_updated,
+                       array_agg(DISTINCT filename) AS filenames
+                FROM   rag_documents
+                GROUP  BY session_id
+                ORDER  BY MIN(created_at) DESC
+                """
+            )
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+        return await asyncio.to_thread(_run)
+
+    else:
+        sb = _get_sb_client()
+        result = await asyncio.to_thread(
+            lambda: sb.table("rag_documents")
+                .select("session_id, filename, created_at")
+                .execute()
+        )
+        rows = result.data or []
+        rags: dict[str, dict] = {}
+        for r in rows:
+            rid = r["session_id"]
+            if rid not in rags:
+                rags[rid] = {
+                    "rag_id":     rid,
+                    "filenames":  set(),
+                    "total_rows": 0,
+                    "created_at": r["created_at"],
+                    "last_updated": r["created_at"],
+                }
+            rags[rid]["filenames"].add(r["filename"])
+            rags[rid]["total_rows"] += 1
+        return [
+            {**s, "filenames": list(s["filenames"]), "file_count": len(s["filenames"])}
+            for s in rags.values()
+        ]
