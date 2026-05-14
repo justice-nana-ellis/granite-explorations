@@ -44,14 +44,18 @@ class ClaudeService:
         system: str,
         model: str | None = None,
         max_tokens: int = 4096,
+        temperature: float | None = None,
     ) -> str:
         use_model = model or settings.claude_chat_model
-        response = await get_client().messages.create(
+        kwargs = dict(
             model=use_model,
             max_tokens=max_tokens,
             system=system,
             messages=messages,
         )
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        response = await get_client().messages.create(**kwargs)
         return _extract_text(response)
 
 

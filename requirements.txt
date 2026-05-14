@@ -12,3 +12,7 @@ python-docx
 python-pptx
 matplotlib
 jinja2
+psycopg2-binary
+pgvector
+supabase
+sentence-transformers

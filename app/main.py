@@ -16,14 +16,38 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     configure_logging()
     configure_cloudinary()
+
     print(f"  ✓  model   {settings.claude_model}")
     print(f"  ✓  chat    {settings.claude_chat_model}")
+
+    # RAG database
+    if settings.database_url:
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(settings.database_url).hostname or "postgres"
+        except Exception:
+            host = "postgres"
+        print(f"  ✓  db      postgres  ({host})")
+    elif settings.supabase_url and settings.supabase_key:
+        project = settings.supabase_url.replace("https://", "").split(".")[0]
+        print(f"  ✓  db      supabase  ({project})")
+    else:
+        print(f"  -  db      not configured  (RAG endpoints disabled)")
+
+    # RAG embeddings
+    if settings.sentence_transformer_model:
+        print(f"  ✓  embed   local  ({settings.sentence_transformer_model})")
+    elif settings.huggingface_api_key:
+        print(f"  ✓  embed   huggingface  (all-MiniLM-L6-v2)")
+    else:
+        print(f"  ✓  embed   local  (all-MiniLM-L6-v2  default)")
+
     print(f"  ✓  ready   http://0.0.0.0:{settings.port}")
     yield
 
 
 def create_app() -> FastAPI:
-    from app.routes import analyze, chat, sessions, upload, visualize
+    from app.routes import analyze, chat, rag, sessions, upload, visualize
 
     app = FastAPI(
         title="Granite Explorations API",
@@ -37,6 +61,7 @@ def create_app() -> FastAPI:
     app.include_router(upload.router)
     app.include_router(analyze.router)
     app.include_router(visualize.router)
+    app.include_router(rag.router)
 
     return app
 
