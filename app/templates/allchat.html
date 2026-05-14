@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block title %}{{ filename }} — Generalli Ai Dashboard{% endblock %}
+
+{% block content %}
+<div class="hero">
+  <h1>&#128202; allChat Dashboard</h1>
+  <div class="meta">
+    <span>&#128196; {{ filename }}</span>
+    <span>&#128273; {{ session_id[:8] }}&#8230;</span>
+    <span>&#128172; {{ question }}</span>
+  </div>
+</div>
+
+{% if kpi_html %}
+<div class="card">
+  <h2 class="section-title">&#127942; Key Metrics</h2>
+  {{ kpi_html | safe }}
+</div>
+{% endif %}
+
+<div class="card">
+  <h2 class="section-title">&#129504; AI Analysis</h2>
+  <div class="analysis-body">{{ analysis_html | safe }}</div>
+</div>
+
+{% if chartjs_html %}
+<div class="card">
+  <h2 class="section-title">&#9728;&#65039; Interactive Charts</h2>
+  {{ chartjs_html | safe }}
+</div>
+{% endif %}
+
+<div class="card">
+  <h2 class="section-title">&#128444;&#65039; Chart Artifacts — click any chart to open full size</h2>
+  <div class="charts-grid">
+    {% if artifacts %}
+      {% for artifact in artifacts %}
+      <div class="ac-card">
+        <div class="ac-card-title">{{ artifact.title }}</div>
+        <span class="ac-badge">{{ artifact.chart_type }}</span>
+        <a href="{{ artifact.url }}" target="_blank" rel="noopener noreferrer" class="ac-img-link">
+          <img src="{{ artifact.url }}" alt="{{ artifact.title }}" loading="lazy" class="ac-img"
+               onclick="openLB('{{ artifact.url }}');event.preventDefault()"/>
+          <div class="ac-img-overlay">&#128269; Open</div>
+        </a>
+        <div class="ac-actions">
+          <a href="{{ artifact.url }}" target="_blank" rel="noopener noreferrer" class="btn-dark">&#128065; Full Screen</a>
+          <a href="{{ artifact.url }}" download class="btn-link">&#8595; Download PNG</a>
+        </div>
+      </div>
+      {% endfor %}
+    {% else %}
+      <p class="muted">Upload a CSV or Excel file to generate chart images.</p>
+    {% endif %}
+  </div>
+</div>
+
+{% if forecast %}
+<section class="card">
+  <h2 class="section-title">&#128200; Forecast &amp; Projections</h2>
+  <p class="forecast-summary">{{ forecast.summary }}</p>
+  <a href="{{ forecast.url }}" target="_blank" rel="noopener noreferrer" class="ac-img-link">
+    <img src="{{ forecast.url }}" alt="Forecast" loading="lazy" class="ac-img"
+         onclick="openLB('{{ forecast.url }}');event.preventDefault()"/>
+    <div class="ac-img-overlay">&#128269; Open</div>
+  </a>
+  <div class="ac-actions" style="margin-top:10px">
+    <a href="{{ forecast.url }}" target="_blank" rel="noopener noreferrer" class="btn-dark">&#128065; Full Screen</a>
+    <a href="{{ forecast.url }}" download class="btn-link">&#8595; Download PNG</a>
+  </div>
+  {% if forecast.forecast_rows %}
+  <table class="fc-table">
+    <thead><tr><th>{{ forecast.x }}</th><th style="text-align:right">Projected {{ forecast.y }}</th></tr></thead>
+    <tbody>
+      {% for row in forecast.forecast_rows %}
+      <tr>
+        <td>{{ row[forecast.x] }}</td>
+        <td style="text-align:right">{{ "%.2f"|format(row[forecast.y]|float) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if jsx_html %}
+<div class="card">
+  <h2 class="section-title">&#9881;&#65039; React / JSX Scaffold — copy &amp; drop into any project</h2>
+  {{ jsx_html | safe }}
+</div>
+{% endif %}
+
+<section class="card">
+  <h2 class="section-title">&#128279; Shareable Links</h2>
+  <div class="link-grid">
+    <div class="link-item">
+      <div class="link-label">&#127968; Full Dashboard</div>
+      <a href="{{ dashboard_url }}" target="_blank" rel="noopener noreferrer" class="link-url">{{ dashboard_url }}</a>
+      <button class="copy-btn" onclick="copyLink('{{ dashboard_url }}',this)">Copy</button>
+    </div>
+    <div class="link-item">
+      <div class="link-label">&#128444; Chart Artifacts JSON</div>
+      <a href="{{ artifacts_url }}" target="_blank" rel="noopener noreferrer" class="link-url">{{ artifacts_url }}</a>
+      <button class="copy-btn" onclick="copyLink('{{ artifacts_url }}',this)">Copy</button>
+    </div>
+    <div class="link-item">
+      <div class="link-label">&#128200; Forecast JSON</div>
+      <a href="{{ forecast_url }}" target="_blank" rel="noopener noreferrer" class="link-url">{{ forecast_url }}</a>
+      <button class="copy-btn" onclick="copyLink('{{ forecast_url }}',this)">Copy</button>
+    </div>
+    <div class="link-item">
+      <div class="link-label">&#9889; Visualize JSON</div>
+      <a href="{{ visualize_url }}" target="_blank" rel="noopener noreferrer" class="link-url">{{ visualize_url }}</a>
+      <button class="copy-btn" onclick="copyLink('{{ visualize_url }}',this)">Copy</button>
+    </div>
+  </div>
+</section>
+{% endblock %}
+
+{% block extra_scripts %}{{ chart_init_js | safe }}{% endblock %}

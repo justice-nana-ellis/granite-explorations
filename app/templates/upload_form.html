@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Upload — Granite Explorations</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'Segoe UI',system-ui,Arial,sans-serif;background:#f3f4f6;padding:24px}
+    .container{max-width:720px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:24px}
+    h2{margin-bottom:16px;color:#111827;font-size:20px}
+    label{display:block;margin-bottom:6px;color:#374151;font-size:14px;font-weight:500}
+    input[type=file],input[type=text]{width:100%;margin-bottom:14px;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:14px}
+    textarea{width:100%;margin-bottom:14px;padding:8px;border:1px solid #d1d5db;border-radius:8px;font-size:14px;resize:vertical}
+    button{background:#111827;color:#fff;border:none;border-radius:8px;padding:10px 20px;font:600 14px Arial,sans-serif;cursor:pointer}
+    button:hover{background:#1e3a8a}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>Upload File for Visual Artifacts and Forecast</h2>
+    <form action="/upload-html" method="post" enctype="multipart/form-data">
+      <label>File</label>
+      <input type="file" name="file" required/>
+      <label>Question</label>
+      <textarea name="question" rows="4">Create clickable visual artifacts and a forecast from this data</textarea>
+      <label>Session ID (optional)</label>
+      <input type="text" name="session_id"/>
+      <button type="submit">Render HTML Dashboard</button>
+    </form>
+  </div>
+</body>
+</html>
