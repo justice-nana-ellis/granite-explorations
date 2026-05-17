@@ -16,3 +16,4 @@ psycopg2-binary
 pgvector
 supabase
 sentence-transformers
+timesfm[torch] @ git+https://github.com/google-research/timesfm.git

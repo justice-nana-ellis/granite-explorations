@@ -43,11 +43,35 @@ async def lifespan(app: FastAPI):
         print(f"  ✓  embed   local  (all-MiniLM-L6-v2  default)")
 
     print(f"  ✓  ready   http://0.0.0.0:{settings.port}")
+
+    # ── Warm up slow models in the background so first requests are instant ──
+    import asyncio
+
+    async def _warm_embedding():
+        try:
+            from app.services.rag_service import _embed
+            await _embed(["warmup"])
+            print("  ✓  embed   model warmed up")
+        except Exception as exc:
+            print(f"  !  embed   warmup failed: {exc}")
+
+    async def _warm_timesfm():
+        try:
+            from app.services.timesfm_service import ensure_loaded
+            await ensure_loaded()
+            print("  ✓  timesfm model warmed up")
+        except Exception as exc:
+            print(f"  !  timesfm warmup failed: {exc}")
+
+    asyncio.create_task(_warm_embedding())
+    if settings.use_timesfm:
+        asyncio.create_task(_warm_timesfm())
+
     yield
 
 
 def create_app() -> FastAPI:
-    from app.routes import analyze, chat, rag, sessions, upload, visualize
+    from app.routes import analyze, chat, fund_forecast, rag, sessions, timesfm, upload, visualize
 
     app = FastAPI(
         title="Granite Explorations API",
@@ -62,6 +86,8 @@ def create_app() -> FastAPI:
     app.include_router(analyze.router)
     app.include_router(visualize.router)
     app.include_router(rag.router)
+    app.include_router(timesfm.router)
+    app.include_router(fund_forecast.router)
 
     return app
 

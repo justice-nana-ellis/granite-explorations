@@ -338,6 +338,9 @@ async def ingest_df(
             await progress_callback(msg)
 
     logger.info("RAG ingestion complete: %d rows — rag_id=%s backend=%s", total, rag_id, backend)
+    invalidate_metadata_cache(rag_id)
+    from app.services.fund_forecast_service import invalidate_analytics_cache
+    invalidate_analytics_cache(rag_id)
     return total
 
 
@@ -467,6 +470,9 @@ async def delete_rag_data(rag_id: str, progress_callback=None) -> None:
     else:
         await _sb_delete(rag_id, progress_callback=progress_callback)
     logger.info("RAG: deleted all rows for rag_id=%s backend=%s", rag_id, backend)
+    invalidate_metadata_cache(rag_id)
+    from app.services.fund_forecast_service import invalidate_analytics_cache
+    invalidate_analytics_cache(rag_id)
 
 
 async def list_rag_files(rag_id: str) -> list[dict]:
@@ -541,7 +547,89 @@ async def delete_rag_file(rag_id: str, filename: str, progress_callback=None) ->
         )
 
     logger.info("RAG: deleted %d rows for file=%s rag_id=%s", count, filename, rag_id)
+    invalidate_metadata_cache(rag_id)
+    from app.services.fund_forecast_service import invalidate_analytics_cache
+    invalidate_analytics_cache(rag_id)
     return count
+
+
+# Cache: (rag_id, limit) → (rows, fetch_time). Avoids re-fetching the same
+# dataset on every forecast call within the TTL window.
+_metadata_cache: dict[tuple, tuple[list, float]] = {}
+_METADATA_CACHE_TTL = 300  # seconds — 5 minutes
+
+
+def invalidate_metadata_cache(rag_id: str) -> None:
+    """Drop all cache entries for a rag_id (call after ingest/delete)."""
+    keys = [k for k in _metadata_cache if k[0] == rag_id]
+    for k in keys:
+        del _metadata_cache[k]
+
+
+async def fetch_all_metadata(rag_id: str, limit: int = 16000) -> list[dict]:
+    """Return raw metadata dicts for every row stored under rag_id.
+
+    Used by non-RAG consumers (e.g. TimesFM) that need the full tabular data
+    rather than a vector search result.  Capped at `limit` rows so callers
+    stay within model context windows.
+
+    Results are cached in-memory for _METADATA_CACHE_TTL seconds so repeated
+    forecast calls against the same rag_id skip the database round-trip.
+    """
+    import time
+
+    key = (rag_id, limit)
+    cached = _metadata_cache.get(key)
+    if cached:
+        rows, ts = cached
+        if time.time() - ts < _METADATA_CACHE_TTL:
+            logger.info("fetch_all_metadata: cache hit rag_id=%s (%d rows)", rag_id, len(rows))
+            return rows
+
+    backend = _backend()
+
+    if backend == "postgres":
+        def _run():
+            conn = _get_pg_conn()
+            cur  = conn.cursor()
+            cur.execute(
+                """
+                SELECT metadata
+                FROM   rag_documents
+                WHERE  session_id = %s
+                ORDER  BY id
+                LIMIT  %s
+                """,
+                (rag_id, limit),
+            )
+            rows = []
+            for (meta,) in cur.fetchall():
+                if isinstance(meta, str):
+                    import json as _json
+                    meta = _json.loads(meta)
+                rows.append(meta or {})
+            return rows
+        rows = await asyncio.to_thread(_run)
+
+    else:
+        sb = _get_sb_client()
+        result = await asyncio.to_thread(
+            lambda: sb.table("rag_documents")
+                .select("metadata")
+                .eq("session_id", rag_id)
+                .limit(limit)
+                .execute()
+        )
+        rows = []
+        for r in (result.data or []):
+            meta = r.get("metadata") or {}
+            if isinstance(meta, str):
+                import json as _json
+                meta = _json.loads(meta)
+            rows.append(meta)
+
+    _metadata_cache[key] = (rows, time.time())
+    return rows
 
 
 async def list_all_rags() -> list[dict]:
@@ -570,26 +658,52 @@ async def list_all_rags() -> list[dict]:
         return await asyncio.to_thread(_run)
 
     else:
-        sb = _get_sb_client()
-        result = await asyncio.to_thread(
-            lambda: sb.table("rag_documents")
-                .select("session_id, filename, created_at")
-                .execute()
-        )
-        rows = result.data or []
+        # Try the fast server-side RPC first (requires list_all_rag_sessions() SQL function).
+        # If the function doesn't exist yet, fall back to paginated client-side aggregation.
+        try:
+            result = await asyncio.to_thread(
+                lambda: _get_sb_client().rpc("list_all_rag_sessions", {}).execute()
+            )
+            return result.data or []
+        except Exception as rpc_err:
+            if "PGRST202" not in str(rpc_err):
+                raise
+            logger.info("list_all_rag_sessions RPC not found — falling back to paginated aggregation")
+
+        # Fallback: page through all rows in chunks of 1000 so every RAG is included
+        PAGE = 1000
         rags: dict[str, dict] = {}
-        for r in rows:
-            rid = r["session_id"]
-            if rid not in rags:
-                rags[rid] = {
-                    "rag_id":     rid,
-                    "filenames":  set(),
-                    "total_rows": 0,
-                    "created_at": r["created_at"],
-                    "last_updated": r["created_at"],
-                }
-            rags[rid]["filenames"].add(r["filename"])
-            rags[rid]["total_rows"] += 1
+        offset = 0
+        while True:
+            def _fetch(o=offset):
+                sb = _get_sb_client()
+                return (
+                    sb.table("rag_documents")
+                    .select("session_id, filename, created_at")
+                    .range(o, o + PAGE - 1)
+                    .execute()
+                    .data or []
+                )
+            rows = await asyncio.to_thread(_fetch)
+            if not rows:
+                break
+            for r in rows:
+                rid = r["session_id"]
+                if rid not in rags:
+                    rags[rid] = {
+                        "rag_id":       rid,
+                        "filenames":    set(),
+                        "total_rows":   0,
+                        "created_at":   r["created_at"],
+                        "last_updated": r["created_at"],
+                    }
+                rags[rid]["filenames"].add(r["filename"])
+                rags[rid]["total_rows"] += 1
+                if r["created_at"] > rags[rid]["last_updated"]:
+                    rags[rid]["last_updated"] = r["created_at"]
+            if len(rows) < PAGE:
+                break
+            offset += PAGE
         return [
             {**s, "filenames": list(s["filenames"]), "file_count": len(s["filenames"])}
             for s in rags.values()

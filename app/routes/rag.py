@@ -5,6 +5,7 @@ import asyncio
 import io
 import json
 import logging
+import re
 from typing import Optional
 from uuid import uuid4
 
@@ -14,8 +15,125 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.services import rag_service
+from app.utils.prompt_library import RAG_FORECASTING_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
+
+
+async def _prewarm_analytics(rag_id: str) -> None:
+    """Background task: pre-compute analytics + context + charts after ingest.
+
+    Uses default column map and 6-month horizon so the cache is warm before
+    the first /forecast/full request arrives.
+    """
+    try:
+        from app.config import settings
+        from app.services.fund_forecast_service import (
+            ColumnMap, build_analytics, build_chart_data,
+            build_claude_context, cache_analytics, run_timesfm_forecasts,
+        )
+        rows = await rag_service.fetch_all_metadata(rag_id, limit=16000)
+        if not rows:
+            return
+        df       = pd.DataFrame(rows)
+        col      = ColumnMap()
+        horizon  = 6
+        analytics = await asyncio.to_thread(build_analytics, df, col)
+        context   = await asyncio.to_thread(build_claude_context, analytics, col, horizon)
+
+        timesfm_results = None
+        if settings.use_timesfm:
+            timesfm_results = await run_timesfm_forecasts(analytics, horizon)
+
+        charts = await asyncio.to_thread(build_chart_data, analytics, timesfm_results, horizon)
+        cache_analytics([rag_id], horizon, col, {
+            "source_rows":     len(rows),
+            "analytics":       analytics,
+            "context":         context,
+            "charts":          charts,
+            "timesfm_results": timesfm_results,
+        })
+        logger.info("Analytics pre-warmed for rag_id=%s (%d rows, timesfm=%s)",
+                    rag_id, len(rows), timesfm_results is not None)
+    except Exception as exc:
+        logger.warning("Analytics pre-warm failed for rag_id=%s: %s", rag_id, exc)
+
+# ── Forecast tool schema ────────────────────────────────────────────────────────
+# Claude is forced to call this tool, so its input is always a validated dict.
+# No JSON parsing or text extraction needed.
+
+FORECAST_TOOL: dict = {
+    "name": "submit_forecast",
+    "description": (
+        "Submit the complete quantitative forecasting report populated from the provided data. "
+        "Every field must be filled. Leave no section empty."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "executive_summary": {
+                "type": "string",
+                "description": "4-6 sentence high-level outlook leading with the most critical insight.",
+            },
+            "data_period": {
+                "type": "object",
+                "properties": {
+                    "earliest":         {"type": "string"},
+                    "latest":           {"type": "string"},
+                    "months_of_history":{"type": "integer"},
+                },
+                "required": ["earliest", "latest", "months_of_history"],
+            },
+            "current_snapshot": {
+                "type": "object",
+                "description": "Current AUM, currency, portfolio/fund counts, latest net flow, key metrics list.",
+                "additionalProperties": True,
+            },
+            "forecasts": {
+                "type": "object",
+                "description": "All forecast sections: aum_trend, net_flows, revenue, churn_risk, portfolio_mix_drift. Each must include projections array and chart_data.",
+                "properties": {
+                    "aum_trend":          {"type": "object", "additionalProperties": True},
+                    "net_flows":          {"type": "object", "additionalProperties": True},
+                    "revenue":            {"type": "object", "additionalProperties": True},
+                    "churn_risk":         {"type": "object", "additionalProperties": True},
+                    "portfolio_mix_drift":{"type": "object", "additionalProperties": True},
+                },
+                "required": ["aum_trend", "net_flows", "revenue", "churn_risk", "portfolio_mix_drift"],
+            },
+            "top_10_performers": {
+                "type": "array",
+                "items": {"type": "object", "additionalProperties": True},
+                "description": "Top 10 funds/clients/portfolios by AUM growth and flow momentum with forward projections.",
+            },
+            "top_10_at_risk": {
+                "type": "array",
+                "items": {"type": "object", "additionalProperties": True},
+                "description": "Top 10 funds/clients/portfolios most at risk of AUM decline or redemption.",
+            },
+            "strategic_recommendations": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Minimum 5 specific, actionable recommendations referencing exact figures from the data.",
+            },
+            "methodology": {
+                "type": "string",
+                "description": "Forecasting methodology, data coverage, and key assumptions used.",
+            },
+            "data_warnings": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Data quality issues, missing fields, or assumptions made (e.g. assumed fee rate).",
+            },
+        },
+        "required": [
+            "executive_summary", "data_period", "current_snapshot", "forecasts",
+            "top_10_performers", "top_10_at_risk", "strategic_recommendations",
+            "methodology", "data_warnings",
+        ],
+    },
+}
+
 router = APIRouter(prefix="/rag", tags=["rag"])
 
 
@@ -24,23 +142,117 @@ def _sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
 
+def _repair_json(s: str) -> str:
+    """Fix the most common LLM JSON mistakes before parsing."""
+    # trailing commas before } or ]
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    # Python-style True/False/None
+    s = re.sub(r"\bTrue\b",  "true",  s)
+    s = re.sub(r"\bFalse\b", "false", s)
+    s = re.sub(r"\bNone\b",  "null",  s)
+    return s
+
+
+def _find_json_object(text: str) -> str:
+    """Return the outermost {...} block using depth-aware scanning."""
+    start = text.index("{")
+    depth, in_str, escape = 0, False, False
+    for i, ch in enumerate(text[start:], start):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_str:
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+        elif not in_str:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+    raise ValueError("No complete JSON object found in response.")
+
+
+def _extract_json(text: str) -> dict:
+    """Parse JSON from Claude's response with multi-stage fallback and auto-repair."""
+    text = text.strip()
+
+    # 1 — direct parse (ideal path)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 2 — strip markdown fences
+    for pattern in [r"```json\s*([\s\S]*?)```", r"```\s*([\s\S]*?)```"]:
+        m = re.search(pattern, text, re.DOTALL)
+        if m:
+            candidate = m.group(1).strip()
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                try:
+                    return json.loads(_repair_json(candidate))
+                except json.JSONDecodeError:
+                    pass
+
+    # 3 — depth-aware brace extraction + repair
+    try:
+        candidate = _find_json_object(text)
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            return json.loads(_repair_json(candidate))
+    except (ValueError, json.JSONDecodeError):
+        pass
+
+    logger.warning(
+        "RAG forecast JSON parse failed. Response preview: %.500s", text
+    )
+    raise ValueError("Could not parse JSON from model response.")
+
+
+def _build_forecast_message(msg: str, horizon: str, context: str) -> str:
+    base = (
+        "Produce a complete, comprehensive forecasting report covering EVERY section "
+        "of the schema without exception: AUM trend, net flows, revenue, churn risk, "
+        "portfolio mix drift, top 10 performers, top 10 at risk, strategic recommendations, "
+        "and methodology. Leave no section empty. Use all available data rows."
+    )
+    extra = msg.strip()
+    default_msg = "Produce a full forecasting report on all available data."
+    additional = (
+        f"\n\nADDITIONAL USER FOCUS: {extra}"
+        if extra and extra != default_msg
+        else ""
+    )
+    return (
+        f"[FORECAST DIRECTIVE]\n{base}{additional}\n\n"
+        f"[FORECAST HORIZON]\nProject forward: {horizon} from the latest available data point.\n\n"
+        f"[DATA ROWS — retrieved by semantic similarity]\n{context}"
+    )
+
+
 # ── Request models ─────────────────────────────────────────────────────────────
 
 class RagQueryRequest(BaseModel):
-    msg: str
+    msg: str = "Produce a full forecasting report on all available data."
     rag_ids: list[str]
-    top_k: int = 15
-    max_tokens: int = 1024
-    temperature: float = 0.7
+    forecast_horizon: str = "6m"   # e.g. "3m", "6m", "1y", "2y"
+    top_k: int = 100               # high to capture maximum historical data
+    max_tokens: int = 16384
     system_prompt: Optional[str] = None
 
 
 class RagChatRequest(BaseModel):
-    msg: str
+    msg: str = "Produce a full forecasting report on all available data."
     rag_ids: list[str]
-    top_k: int = 10          # rows retrieved per rag_id
-    max_tokens: int = 1024
-    temperature: float = 0.7
+    forecast_horizon: str = "6m"
+    top_k: int = 100
+    max_tokens: int = 16384
     system_prompt: Optional[str] = None
 
 
@@ -165,6 +377,10 @@ async def rag_ingest(
             })
             await queue.put(None)  # sentinel
 
+            # Pre-warm analytics cache so /forecast/full skips computation
+            if results:
+                asyncio.create_task(_prewarm_analytics(rid))
+
         asyncio.create_task(run_ingestion())
 
         yield _sse({
@@ -183,15 +399,19 @@ async def rag_ingest(
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
-# ── Query (one or more rag_ids, plain JSON response) ──────────────────────────
+# ── Query — forecasting agent, plain JSON response ─────────────────────────────
 
 @router.post("/query")
 async def rag_query(body: RagQueryRequest):
-    """Ask a question against one or more rag_ids. Returns a plain JSON response."""
-    if not body.msg.strip():
-        raise HTTPException(status_code=400, detail="msg is required.")
+    """
+    Forecasting agent. Uses tool use to guarantee a valid structured response —
+    no JSON parsing, no parse_error. Returns the full forecast object directly.
+    """
     if not body.rag_ids:
         raise HTTPException(status_code=400, detail="At least one rag_id is required.")
+
+    from app.services.claude_service import claude_service
+    from app.config import settings
 
     try:
         all_rows, context = await rag_service.rag_retrieve_multi(
@@ -200,60 +420,54 @@ async def rag_query(body: RagQueryRequest):
             top_k=body.top_k,
         )
     except Exception as exc:
-        logger.exception("RAG query retrieve failed for rag_ids %s", body.rag_ids)
+        logger.exception("RAG forecast retrieve failed for rag_ids %s", body.rag_ids)
         raise HTTPException(status_code=500, detail=str(exc))
 
-    system = body.system_prompt or (
-        "You are a precise data analyst. Answer using only the provided data rows. "
-        "Be specific, cite exact numbers, and highlight key trends."
-    )
-    messages = [{
-        "role": "user",
-        "content": f"[Relevant data rows]\n{context}\n\n[Question]\n{body.msg}",
-    }]
+    system   = body.system_prompt or RAG_FORECASTING_SYSTEM_PROMPT
+    messages = [{"role": "user", "content": _build_forecast_message(body.msg, body.forecast_horizon, context)}]
 
     try:
-        from app.services.claude_service import claude_service
-        from app.config import settings
-        analysis = await claude_service.complete(
-            messages,
+        forecast = await claude_service.complete_with_tool(
+            messages=messages,
             system=system,
-            model=settings.claude_chat_model,
+            tool=FORECAST_TOOL,
+            model=settings.claude_model,
             max_tokens=body.max_tokens,
-            temperature=body.temperature,
         )
     except Exception as exc:
-        logger.exception("RAG query Claude call failed for rag_ids %s", body.rag_ids)
+        logger.exception("RAG forecast tool call failed for rag_ids %s", body.rag_ids)
         raise HTTPException(status_code=500, detail=str(exc))
 
     return {
-        "rag_ids": body.rag_ids,
-        "question": body.msg,
-        "analysis": analysis,
-        "retrieved_rows": len(all_rows),
-        "sources": all_rows[:5],
+        "rag_ids":          body.rag_ids,
+        "forecast_horizon": body.forecast_horizon,
+        "retrieved_rows":   len(all_rows),
+        "forecast":         forecast,
     }
 
 
-# ── Chat (multiple rag_ids, streaming) ────────────────────────────────────────
+# ── Chat — forecasting agent, streaming SSE ────────────────────────────────────
 
 @router.post("/chat")
 async def rag_chat(body: RagChatRequest):
     """
-    Ask a question across multiple rag_ids. Streams the answer as SSE.
+    Forecasting agent: streams the forecast as it is generated, then emits a
+    final 'forecast' event containing the fully parsed structured JSON object
+    (including all chart data) so the frontend can render visuals immediately.
 
     Event types:
-      sources  — fired once upfront: retrieved row count + top-5 source rows
-      chunk    — one text fragment of Claude's answer (reassemble in order)
-      error    — Claude call failed
-      done     — stream finished
+      sources   — fired first: retrieved row count (no waiting)
+      chunk     — one text fragment of the forecast as Claude writes it
+      forecast  — parsed structured JSON object with all chart-ready data
+      done      — stream complete
+      error     — something failed mid-stream
     """
-    if not body.msg.strip():
-        raise HTTPException(status_code=400, detail="msg is required.")
     if not body.rag_ids:
         raise HTTPException(status_code=400, detail="At least one rag_id is required.")
 
-    # Retrieve rows before opening the stream so errors surface as HTTP 500
+    from app.services.claude_service import claude_service
+    from app.config import settings
+
     try:
         all_rows, context = await rag_service.rag_retrieve_multi(
             question=body.msg,
@@ -261,48 +475,64 @@ async def rag_chat(body: RagChatRequest):
             top_k=body.top_k,
         )
     except Exception as exc:
-        logger.exception("RAG retrieve failed for rag_ids %s", body.rag_ids)
+        logger.exception("RAG forecast retrieve failed for rag_ids %s", body.rag_ids)
         raise HTTPException(status_code=500, detail=str(exc))
 
-    system = body.system_prompt or (
-        "You are a precise data analyst. Answer using only the provided data rows. "
-        "Be specific, cite exact numbers, and highlight key trends."
-    )
-    messages = [{
-        "role": "user",
-        "content": f"[Relevant data rows]\n{context}\n\n[Question]\n{body.msg}",
-    }]
+    system   = body.system_prompt or RAG_FORECASTING_SYSTEM_PROMPT
+    messages = [{"role": "user", "content": _build_forecast_message(body.msg, body.forecast_horizon, context)}]
 
     async def event_stream():
-        from app.services.claude_service import claude_service
-
-        # Send retrieved sources first so the client can render them immediately
+        # Emit sources immediately so the client knows retrieval succeeded
         yield _sse({
-            "type": "sources",
-            "rag_ids": body.rag_ids,
-            "question": body.msg,
-            "retrieved_rows": len(all_rows),
-            "sources": all_rows[:5],
+            "type":             "sources",
+            "rag_ids":          body.rag_ids,
+            "forecast_horizon": body.forecast_horizon,
+            "retrieved_rows":   len(all_rows),
+            "message":          f"Retrieved {len(all_rows):,} data rows. Generating forecast…",
         })
 
-        try:
-            async for chunk in claude_service.stream(
-                messages=messages,
-                system=system,
-                model=None,
-                max_tokens=body.max_tokens,
-                temperature=body.temperature,
-            ):
-                yield _sse({"type": "chunk", "text": chunk})
-        except Exception as exc:
-            logger.exception("RAG chat stream failed for rag_ids %s", body.rag_ids)
-            yield _sse({"type": "error", "message": str(exc)})
+        # Tool-use call (blocking but guaranteed valid) — run via task so SSE stays open
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def run_forecast():
+            try:
+                result = await claude_service.complete_with_tool(
+                    messages=messages,
+                    system=system,
+                    tool=FORECAST_TOOL,
+                    model=settings.claude_model,
+                    max_tokens=body.max_tokens,
+                )
+                await queue.put({"ok": True, "forecast": result})
+            except Exception as exc:
+                await queue.put({"ok": False, "error": str(exc)})
+
+        asyncio.create_task(run_forecast())
+
+        # Keep the SSE connection alive with heartbeats while waiting
+        import asyncio as _asyncio
+        heartbeat = 0
+        while True:
+            try:
+                result = queue.get_nowait()
+                break
+            except _asyncio.QueueEmpty:
+                heartbeat += 1
+                yield _sse({"type": "heartbeat", "tick": heartbeat,
+                            "message": "Forecast generation in progress…"})
+                await _asyncio.sleep(3)
+
+        if not result["ok"]:
+            logger.exception("RAG forecast tool call failed for rag_ids %s", body.rag_ids)
+            yield _sse({"type": "error", "message": result["error"]})
             return
 
+        yield _sse({"type": "forecast", "forecast": result["forecast"]})
         yield _sse({
-            "type": "done",
-            "rag_ids": body.rag_ids,
-            "retrieved_rows": len(all_rows),
+            "type":             "done",
+            "rag_ids":          body.rag_ids,
+            "forecast_horizon": body.forecast_horizon,
+            "retrieved_rows":   len(all_rows),
         })
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

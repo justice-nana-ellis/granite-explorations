@@ -6,6 +6,8 @@ class Settings(BaseSettings):
     claude_api_key: str
     claude_model: str = "claude-opus-4-7"
     claude_chat_model: str = "claude-haiku-4-5-20251001"
+    claude_forecast_model: str = "claude-sonnet-4-6"
+    claude_forecast_max_tokens: int = 16384
     port: int = 8000
 
     session_ttl: int = 3600
@@ -29,6 +31,12 @@ class Settings(BaseSettings):
     # Option B — local sentence-transformers (no key, ~90 MB download once)
     #   Leave blank → uses all-MiniLM-L6-v2; or set a custom HF model name
     sentence_transformer_model: str = ""
+
+    # ── TimesFM ───────────────────────────────────────────────────────────────
+    # Set USE_TIMESFM=true to enable Google TimesFM statistical forecasting.
+    # When disabled, Claude handles all projections on its own.
+    # Requires: pip install timesfm[torch]  AND  Python 3.10+
+    use_timesfm: bool = False
 
     model_config = SettingsConfigDict(
         env_file=Path(__file__).parents[1] / ".env",

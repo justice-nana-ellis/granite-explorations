@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 from typing import AsyncIterator
 
+import httpx
 from anthropic import AsyncAnthropic
 
 from app.config import settings
@@ -16,7 +17,11 @@ _client: AsyncAnthropic | None = None
 def get_client() -> AsyncAnthropic:
     global _client
     if _client is None:
-        _client = AsyncAnthropic(api_key=settings.claude_api_key)
+        # connect=10s, read=600s — large forecast responses can take several minutes
+        _client = AsyncAnthropic(
+            api_key=settings.claude_api_key,
+            timeout=httpx.Timeout(600.0, connect=10.0),
+        )
     return _client
 
 
@@ -61,6 +66,36 @@ class ClaudeService:
             kwargs["temperature"] = temperature
         response = await get_client().messages.create(**kwargs)
         return _extract_text(response)
+
+    async def complete_with_tool(
+        self,
+        messages: list[dict],
+        system: str,
+        tool: dict,
+        model: str | None = None,
+        max_tokens: int = 16384,
+    ) -> dict:
+        """Call Claude with a forced tool choice and return the tool input as a dict."""
+        use_model = model or settings.claude_model
+        response = await get_client().messages.create(
+            model=use_model,
+            max_tokens=max_tokens,
+            system=system,
+            tools=[tool],
+            tool_choice={"type": "tool", "name": tool["name"]},
+            messages=messages,
+        )
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            raise ValueError(
+                f"Model hit max_tokens ({max_tokens}) before finishing — "
+                "increase max_tokens or reduce context."
+            )
+        for block in response.content:
+            if hasattr(block, "input") and isinstance(block.input, dict):
+                if not block.input:
+                    raise ValueError("Model returned an empty tool input.")
+                return block.input
+        raise ValueError("Model did not return a tool_use block.")
 
 
 def _extract_text(response) -> str:
