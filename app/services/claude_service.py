@@ -21,6 +21,7 @@ def get_client() -> AsyncAnthropic:
         _client = AsyncAnthropic(
             api_key=settings.claude_api_key,
             timeout=httpx.Timeout(600.0, connect=10.0),
+            max_retries=4,
         )
     return _client
 

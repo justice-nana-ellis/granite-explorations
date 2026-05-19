@@ -66,6 +66,36 @@ class StorageService:
             logger.debug("State restore failed for session %s: %s", session_id, exc)
             return None
 
+    async def list_rag_session_ids(self) -> list[str]:
+        """Return all session_ids that have a state.json saved in Cloudinary."""
+        def _fetch():
+            results, next_cursor = [], None
+            while True:
+                kwargs: dict = {
+                    "resource_type": "raw",
+                    "type": "upload",
+                    "prefix": "sessions/",
+                    "max_results": 500,
+                }
+                if next_cursor:
+                    kwargs["next_cursor"] = next_cursor
+                resp = cloudinary.api.resources(**kwargs)
+                results.extend(resp.get("resources", []))
+                next_cursor = resp.get("next_cursor")
+                if not next_cursor:
+                    break
+            return results
+
+        all_resources = await asyncio.to_thread(_fetch)
+        ids = []
+        for r in all_resources:
+            pub = r["public_id"]  # e.g. "sessions/<sid>/state.json"
+            if pub.endswith("/state.json"):
+                parts = pub.split("/")
+                if len(parts) == 3:
+                    ids.append(parts[1])
+        return ids
+
     def delete(self, public_id: str, resource_type: str = "raw") -> None:
         try:
             cloudinary.uploader.destroy(public_id, resource_type=resource_type)

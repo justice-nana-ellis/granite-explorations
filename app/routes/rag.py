@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Optional
 from uuid import uuid4
 
@@ -15,6 +16,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.services import rag_service
+from app.services.session_service import session_service
+from app.services.storage_service import storage_service
 from app.utils.prompt_library import RAG_FORECASTING_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
@@ -236,6 +239,91 @@ def _build_forecast_message(msg: str, horizon: str, context: str) -> str:
     )
 
 
+# ── Session helpers for /query ──────────────────────────────────────────────────
+
+def _compact_forecast_summary(forecast: dict) -> str:
+    """Token-efficient text summary stored in session instead of the full JSON."""
+    lines = ["[Forecast Analysis Complete]"]
+    dp = forecast.get("data_period") or {}
+    if dp:
+        lines.append(
+            f"Period: {dp.get('earliest', '?')} – {dp.get('latest', '?')} "
+            f"({dp.get('months_of_history', '?')} months)"
+        )
+    snap = forecast.get("current_snapshot") or {}
+    aum = snap.get("aum") or snap.get("total_aum") or snap.get("aum_latest") or snap.get("latest_aum")
+    if aum:
+        lines.append(f"Latest AUM: {aum}")
+    summary = forecast.get("executive_summary")
+    if summary:
+        lines.append(f"Summary: {str(summary)[:600]}")
+    recs = forecast.get("strategic_recommendations") or []
+    if recs:
+        lines.append("Top Recommendations:")
+        for r in recs[:3]:
+            lines.append(f"  - {r}")
+    return "\n".join(lines)
+
+
+def _trim_rag_session(session: dict) -> None:
+    """Rolling-window trim for RAG sessions.
+
+    SESSION_MAX_MESSAGES = number of Q&A *pairs*.
+    Each pair occupies 2 entries in messages/display and 1 entry in rag_history.
+    When the limit is exceeded the oldest pair is dropped from all three lists.
+    """
+    from app.config import settings
+    max_pairs = max(1, settings.session_max_messages)
+    max_msgs  = max_pairs * 2  # 2 messages per pair (user + assistant)
+
+    if len(session["messages"]) > max_msgs:
+        session["messages"] = session["messages"][-max_msgs:]
+    if len(session["display"]) > max_msgs:
+        session["display"] = session["display"][-max_msgs:]
+
+    history: list = session.setdefault("rag_history", [])
+    if len(history) > max_pairs:
+        session["rag_history"] = history[-max_pairs:]
+
+
+async def _save_rag_session(sid: str, session: dict) -> None:
+    """Background task: persist session state + full history to Cloudinary."""
+    try:
+        state = {
+            "system":      session.get("system", ""),
+            "display":     session.get("display", []),
+            "messages":    session.get("messages", []),
+            "rag_history": session.get("rag_history", []),
+        }
+        await storage_service.upload_state(sid, state)
+        session["state_cloudinary_id"] = f"sessions/{sid}/state.json"
+        logger.debug(
+            "RAG session saved for sid=%s (%d msgs, %d history entries)",
+            sid, len(state["messages"]), len(state["rag_history"]),
+        )
+    except Exception as exc:
+        logger.warning("RAG session state save failed for sid=%s: %s", sid, exc)
+
+
+async def _restore_rag_session(sid: str, session: dict) -> None:
+    """Restore messages, display, and full history from Cloudinary."""
+    try:
+        state = await storage_service.fetch_state(sid)
+        if not state:
+            return
+        session["system"]      = state.get("system") or session["system"]
+        session["display"]     = state.get("display", [])
+        session["messages"]    = state.get("messages", [])
+        session["rag_history"] = state.get("rag_history", [])
+        session["state_cloudinary_id"] = f"sessions/{sid}/state.json"
+        logger.debug(
+            "RAG session restored for sid=%s (%d msgs, %d history entries)",
+            sid, len(session["messages"]), len(session["rag_history"]),
+        )
+    except Exception as exc:
+        logger.debug("RAG session restore failed for sid=%s: %s", sid, exc)
+
+
 # ── Request models ─────────────────────────────────────────────────────────────
 
 class RagQueryRequest(BaseModel):
@@ -245,6 +333,7 @@ class RagQueryRequest(BaseModel):
     top_k: int = 100               # high to capture maximum historical data
     max_tokens: int = 16384
     system_prompt: Optional[str] = None
+    session_id: Optional[str] = None  # omit to start a new session
 
 
 class RagChatRequest(BaseModel):
@@ -404,8 +493,12 @@ async def rag_ingest(
 @router.post("/query")
 async def rag_query(body: RagQueryRequest):
     """
-    Forecasting agent. Uses tool use to guarantee a valid structured response —
-    no JSON parsing, no parse_error. Returns the full forecast object directly.
+    Forecasting agent with session support.
+
+    First call  — full RAG retrieve → tool-use forecast → compact summary saved to session.
+    Follow-up   — targeted retrieval (top_k=10) → chat completion using session history.
+    Pass session_id from a previous response to continue the conversation.
+    Rolling window is enforced via SESSION_MAX_MESSAGES.
     """
     if not body.rag_ids:
         raise HTTPException(status_code=400, detail="At least one rag_id is required.")
@@ -413,36 +506,144 @@ async def rag_query(body: RagQueryRequest):
     from app.services.claude_service import claude_service
     from app.config import settings
 
+    sid    = body.session_id or str(uuid4())
+    system = body.system_prompt or RAG_FORECASTING_SYSTEM_PROMPT
+    session = session_service.get_or_create(sid, system)
+
+    # Restore from Cloudinary when the session_id was supplied but not in memory
+    if body.session_id and len(session["messages"]) == 0 and not session.get("state_cloudinary_id"):
+        await _restore_rag_session(sid, session)
+
+    is_first = len(session["messages"]) == 0
+
+    # ── First message: full retrieval + tool-use forecast ───────────────────────
+    if is_first:
+        try:
+            all_rows, context = await rag_service.rag_retrieve_multi(
+                question=body.msg,
+                rag_ids=body.rag_ids,
+                top_k=body.top_k,
+            )
+        except Exception as exc:
+            logger.exception("RAG forecast retrieve failed for rag_ids %s", body.rag_ids)
+            raise HTTPException(status_code=500, detail=str(exc))
+
+        # Store compact user message so session history stays small
+        session["messages"].append({"role": "user", "content": body.msg})
+        session["display"].append({"role": "user", "content": body.msg})
+
+        # Claude gets the full data context (not stored in session)
+        claude_messages = [
+            {"role": "user", "content": _build_forecast_message(body.msg, body.forecast_horizon, context)}
+        ]
+
+        try:
+            forecast = await claude_service.complete_with_tool(
+                messages=claude_messages,
+                system=system,
+                tool=FORECAST_TOOL,
+                model=settings.claude_model,
+                max_tokens=body.max_tokens,
+            )
+        except Exception as exc:
+            # Roll back the user message we already appended
+            session["messages"].pop()
+            session["display"].pop()
+            logger.exception("RAG forecast tool call failed for rag_ids %s", body.rag_ids)
+            raise HTTPException(status_code=500, detail=str(exc))
+
+        # Store compact summary so follow-up context is token-efficient
+        compact = _compact_forecast_summary(forecast)
+        session["messages"].append({"role": "assistant", "content": compact})
+        session["display"].append({"role": "assistant", "content": compact})
+
+        # Record full Q&A in history, then enforce rolling window
+        session.setdefault("rag_history", []).append({
+            "ts":       datetime.now(timezone.utc).isoformat(),
+            "type":     "forecast",
+            "question": body.msg,
+            "answer":   forecast,
+        })
+        _trim_rag_session(session)
+        session_service.touch(sid)
+
+        asyncio.create_task(_save_rag_session(sid, session))
+
+        return {
+            "session_id":       sid,
+            "rag_ids":          body.rag_ids,
+            "forecast_horizon": body.forecast_horizon,
+            "retrieved_rows":   len(all_rows),
+            "is_first_message": True,
+            "forecast":         forecast,
+        }
+
+    # ── Follow-up: small targeted retrieval + chat completion ──────────────────
     try:
-        all_rows, context = await rag_service.rag_retrieve_multi(
+        follow_rows, follow_context = await rag_service.rag_retrieve_multi(
             question=body.msg,
             rag_ids=body.rag_ids,
-            top_k=body.top_k,
+            top_k=10,
         )
     except Exception as exc:
-        logger.exception("RAG forecast retrieve failed for rag_ids %s", body.rag_ids)
+        logger.exception("RAG follow-up retrieve failed for rag_ids %s", body.rag_ids)
         raise HTTPException(status_code=500, detail=str(exc))
 
-    system   = body.system_prompt or RAG_FORECASTING_SYSTEM_PROMPT
-    messages = [{"role": "user", "content": _build_forecast_message(body.msg, body.forecast_horizon, context)}]
+    follow_content = (
+        f"[Follow-up Question]\n{body.msg}\n\n"
+        f"[Relevant Data — {len(follow_rows)} rows]\n{follow_context}"
+    )
+    session["messages"].append({"role": "user", "content": follow_content})
+    session["display"].append({"role": "user", "content": body.msg})
 
     try:
-        forecast = await claude_service.complete_with_tool(
-            messages=messages,
+        reply = await claude_service.complete(
+            messages=session["messages"],
             system=system,
-            tool=FORECAST_TOOL,
             model=settings.claude_model,
             max_tokens=body.max_tokens,
         )
     except Exception as exc:
-        logger.exception("RAG forecast tool call failed for rag_ids %s", body.rag_ids)
+        session["messages"].pop()
+        session["display"].pop()
+        logger.exception("RAG follow-up call failed for rag_ids %s", body.rag_ids)
         raise HTTPException(status_code=500, detail=str(exc))
 
+    # Claude may return structured JSON even via complete() because the system
+    # prompt instructs it to. Parse it so the client gets a dict, not a string.
+    try:
+        reply_data = _extract_json(reply)
+    except Exception:
+        reply_data = reply  # plain text answer — that's fine too
+
+    # Store compact text in session so follow-up context stays small
+    compact_reply = (
+        _compact_forecast_summary(reply_data)
+        if isinstance(reply_data, dict)
+        else reply_data
+    )
+    session["messages"].append({"role": "assistant", "content": compact_reply})
+    session["display"].append({"role": "assistant", "content": compact_reply})
+
+    # Record full parsed answer in history, then enforce rolling window
+    session.setdefault("rag_history", []).append({
+        "ts":       datetime.now(timezone.utc).isoformat(),
+        "type":     "followup",
+        "question": body.msg,
+        "answer":   reply_data,
+    })
+    _trim_rag_session(session)
+    session_service.touch(sid)
+
+    asyncio.create_task(_save_rag_session(sid, session))
+
     return {
+        "session_id":       sid,
         "rag_ids":          body.rag_ids,
         "forecast_horizon": body.forecast_horizon,
-        "retrieved_rows":   len(all_rows),
-        "forecast":         forecast,
+        "retrieved_rows":   len(follow_rows),
+        "is_first_message": False,
+        "reply":            reply_data,
     }
 
 
@@ -539,6 +740,86 @@ async def rag_chat(body: RagChatRequest):
 
 
 # ── Management ─────────────────────────────────────────────────────────────────
+
+@router.get("/sessions")
+async def rag_list_sessions():
+    """
+    List every RAG query session with its full Q&A history.
+
+    Checks in-memory sessions first, then Cloudinary for any sessions that
+    survived a server restart.  Both sources are merged and deduplicated.
+    """
+    # ── 1. In-memory sessions ──────────────────────────────────────────────────
+    all_sessions = session_service.get_all()
+    seen: set[str] = set()
+    result = []
+    for sid, s in all_sessions.items():
+        if "rag_history" not in s:
+            continue
+        seen.add(sid)
+        result.append({
+            "session_id":    sid,
+            "pair_count":    len(s.get("rag_history", [])),
+            "last_accessed": s.get("last_accessed"),
+            "history":       s.get("rag_history", []),
+        })
+
+    # ── 2. Cloudinary-persisted sessions not currently in memory ──────────────
+    try:
+        cloud_ids = await storage_service.list_rag_session_ids()
+        missing = [sid for sid in cloud_ids if sid not in seen]
+
+        # Fetch all missing states in parallel — one round-trip regardless of count
+        states = await asyncio.gather(
+            *[storage_service.fetch_state(sid) for sid in missing],
+            return_exceptions=True,
+        )
+        for sid, state in zip(missing, states):
+            if isinstance(state, Exception) or not state or "rag_history" not in state:
+                continue
+            result.append({
+                "session_id":    sid,
+                "pair_count":    len(state.get("rag_history", [])),
+                "last_accessed": None,
+                "history":       state.get("rag_history", []),
+            })
+    except Exception as exc:
+        logger.warning("Could not list Cloudinary RAG sessions: %s", exc)
+
+    result.sort(key=lambda x: x["last_accessed"] or 0, reverse=True)
+    return {"count": len(result), "sessions": result}
+
+
+@router.get("/session/{session_id}/history")
+async def rag_session_history(session_id: str):
+    """
+    Return the full Q&A history for a /rag/query session.
+
+    Checks in-memory session first; falls back to Cloudinary if the server
+    restarted.  Each entry contains:
+      ts       — UTC timestamp of the interaction
+      type     — "forecast" (first message) or "followup"
+      question — the question that was asked
+      answer   — full forecast dict (type=forecast) or reply text (type=followup)
+    """
+    from app.services.session_service import session_service
+
+    session = session_service.get(session_id)
+    if session and session.get("rag_history"):
+        history = session["rag_history"]
+    else:
+        # Not in memory — try Cloudinary
+        state = await storage_service.fetch_state(session_id)
+        if not state:
+            raise HTTPException(status_code=404, detail=f"No session found for session_id '{session_id}'.")
+        history = state.get("rag_history", [])
+
+    return {
+        "session_id":    session_id,
+        "total_entries": len(history),
+        "history":       history,
+    }
+
 
 @router.get("/ragIDs")
 async def rag_list_ids():
