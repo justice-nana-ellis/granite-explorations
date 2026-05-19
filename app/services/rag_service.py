@@ -668,7 +668,7 @@ async def list_all_rags() -> list[dict]:
         except Exception as rpc_err:
             if "PGRST202" not in str(rpc_err):
                 raise
-            logger.info("list_all_rag_sessions RPC not found — falling back to paginated aggregation")
+            logger.debug("list_all_rag_sessions RPC not found — falling back to paginated aggregation")
 
         # Fallback: page through all rows in chunks of 1000 so every RAG is included
         PAGE = 1000
