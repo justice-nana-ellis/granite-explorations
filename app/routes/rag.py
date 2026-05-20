@@ -821,6 +821,48 @@ async def rag_session_history(session_id: str):
     }
 
 
+@router.delete("/session/{session_id}")
+async def rag_delete_session(session_id: str):
+    """
+    Delete a RAG query session — removes it from memory and from Cloudinary.
+    Returns 404 if the session does not exist in either location.
+    """
+    deleted_memory     = False
+    deleted_cloudinary = False
+
+    # ── Remove from memory ────────────────────────────────────────────────────
+    session = session_service.delete(session_id)
+    if session:
+        deleted_memory = True
+        # session_service.delete already called _delete_cloudinary which removes
+        # the state file if state_cloudinary_id was set on the session object.
+        deleted_cloudinary = bool(session.get("state_cloudinary_id"))
+
+    # ── Remove from Cloudinary (covers server-restart / not-in-memory case) ──
+    if not deleted_cloudinary:
+        try:
+            storage_service.delete(
+                f"sessions/{session_id}/state.json", resource_type="raw"
+            )
+            deleted_cloudinary = True
+        except Exception as exc:
+            logger.debug("Cloudinary session delete failed for %s: %s", session_id, exc)
+
+    if not deleted_memory and not deleted_cloudinary:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No session found for session_id '{session_id}'.",
+        )
+
+    return {
+        "session_id":          session_id,
+        "deleted":             True,
+        "deleted_from_memory": deleted_memory,
+        "deleted_from_cloudinary": deleted_cloudinary,
+        "message": f"Session '{session_id}' deleted successfully.",
+    }
+
+
 @router.get("/ragIDs")
 async def rag_list_ids():
     """List every rag_id with its files and total row count."""
